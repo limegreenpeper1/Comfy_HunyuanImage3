@@ -1,0 +1,8 @@
+transformers>=4.47.0
+torch>=2.7.0
+bitsandbytes>=0.45.0
+accelerate>=1.2.1
+safetensors>=0.4.5
+pillow>=11.0.0
+numpy>=1.26.0
+requests>=2.32.0
