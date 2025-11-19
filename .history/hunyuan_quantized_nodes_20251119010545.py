@@ -161,11 +161,6 @@ class HunyuanImage3QuantizedLoader:
         if cached is not None:
             return (cached,)
 
-        # Clear CUDA cache to start fresh
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        
         # Report VRAM before loading
         if torch.cuda.is_available():
             free, total = torch.cuda.mem_get_info(0)

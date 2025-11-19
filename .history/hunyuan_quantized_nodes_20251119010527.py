@@ -161,11 +161,6 @@ class HunyuanImage3QuantizedLoader:
         if cached is not None:
             return (cached,)
 
-        # Clear CUDA cache to start fresh
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        
         # Report VRAM before loading
         if torch.cuda.is_available():
             free, total = torch.cuda.mem_get_info(0)
@@ -216,21 +211,9 @@ class HunyuanImage3QuantizedLoader:
 
         model = None
         try:
-            # Calculate max memory to use (leave some headroom for generation)
-            max_memory_dict = None
-            if torch.cuda.is_available():
-                free, total = torch.cuda.mem_get_info(0)
-                # Reserve 8GB for generation overhead and leave 10% headroom
-                reserve_gb = 8.0
-                headroom = 0.10
-                max_gpu_memory = int((total / 1024**3 - reserve_gb) * (1 - headroom) * 1024**3)
-                max_memory_dict = {0: max_gpu_memory, "cpu": "100GiB"}
-                logger.info(f"Setting max GPU memory to {max_gpu_memory/1024**3:.1f}GB (reserving {reserve_gb}GB)")
-            
             load_kwargs = dict(
                 quantization_config=quant_config,
-                device_map="auto" if max_memory_dict else "cuda:0",
-                max_memory=max_memory_dict,
+                device_map="cuda:0",
                 trust_remote_code=True,
                 torch_dtype=torch.bfloat16,
                 attn_implementation="sdpa",

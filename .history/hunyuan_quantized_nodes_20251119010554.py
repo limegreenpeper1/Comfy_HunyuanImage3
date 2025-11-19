@@ -169,7 +169,7 @@ class HunyuanImage3QuantizedLoader:
         # Report VRAM before loading
         if torch.cuda.is_available():
             free, total = torch.cuda.mem_get_info(0)
-            logger.info(f"VRAM before load: {(total-free)/1024**3:.2f}GB used / {total/1024**3:.2f}GB total ({free/1024**3:.2f}GB free)")
+            logger.info(f"VRAM before load: {(total-free)/1024**3:.2f}GB used / {total/1024**3:.2f}GB total ({free/1024**3:.2f}GB free)\")
         
         logger.info(f"Loading {model_name}")
         logger.info("Creating NF4 quantization config (attention layers in full precision)...")
