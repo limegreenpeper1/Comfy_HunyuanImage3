@@ -119,9 +119,6 @@ class HunyuanImage3QuantizedLoader:
             "required": {
                 "model_name": (cls._get_available_models(),),
             },
-            "optional": {
-                "unload_signal": ("*", {"default": None}),
-            }
         }
     
     RETURN_TYPES = ("HUNYUAN_MODEL",)
@@ -140,9 +137,7 @@ class HunyuanImage3QuantizedLoader:
         
         return available if available else ["HunyuanImage-3-NF4"]
     
-    def load_model(self, model_name, unload_signal=None):
-        # unload_signal forces re-execution if model was cleared
-        # The value doesn't matter, just that it changed from previous run
+    def load_model(self, model_name):
         model_path = Path(folder_paths.models_dir) / model_name
         model_path_str = str(model_path)
 

@@ -392,8 +392,8 @@ class HunyuanImage3Unload:
             }
         }
 
-    RETURN_TYPES = ("BOOLEAN", "*")
-    RETURN_NAMES = ("cleared", "unload_signal")
+    RETURN_TYPES = ("BOOLEAN",)
+    RETURN_NAMES = ("cleared",)
     FUNCTION = "unload"
     CATEGORY = "HunyuanImage3"
     OUTPUT_NODE = True
@@ -427,8 +427,4 @@ class HunyuanImage3Unload:
         else:
             logger.info("Cache already empty, cleared CUDA cache only")
         
-        # Return a unique value each time to force downstream loaders to re-execute
-        import time
-        unload_signal = time.time()
-        
-        return (released, unload_signal)
+        return (released,)

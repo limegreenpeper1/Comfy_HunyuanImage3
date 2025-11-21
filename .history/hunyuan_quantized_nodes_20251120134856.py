@@ -119,9 +119,6 @@ class HunyuanImage3QuantizedLoader:
             "required": {
                 "model_name": (cls._get_available_models(),),
             },
-            "optional": {
-                "unload_signal": ("*", {"default": None}),
-            }
         }
     
     RETURN_TYPES = ("HUNYUAN_MODEL",)
@@ -140,9 +137,7 @@ class HunyuanImage3QuantizedLoader:
         
         return available if available else ["HunyuanImage-3-NF4"]
     
-    def load_model(self, model_name, unload_signal=None):
-        # unload_signal forces re-execution if model was cleared
-        # The value doesn't matter, just that it changed from previous run
+    def load_model(self, model_name):
         model_path = Path(folder_paths.models_dir) / model_name
         model_path_str = str(model_path)
 
@@ -398,27 +393,6 @@ class HunyuanImage3Generate:
     def generate(self, model, prompt, seed, steps, resolution, guidance_scale, 
                  enable_prompt_rewrite=False, rewrite_style="none", api_key="", 
                  api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat"):
-        # Validate model has valid device placement before generation
-        try:
-            has_valid_device = False
-            for param in model.parameters():
-                if param.device.type == 'cuda' and param.device.index is not None:
-                    has_valid_device = True
-                    break
-                elif param.device.type == 'cpu' or param.device.index is None:
-                    break
-            
-            if not has_valid_device:
-                raise RuntimeError(
-                    "Model has invalid device placement (likely cleared by Unload node). "
-                    "Please ensure the model loader runs before generation in your workflow. "
-                    "The model may have been unloaded by a previous Unload node."
-                )
-        except Exception as e:
-            if "invalid device" in str(e).lower() or "cleared by unload" in str(e).lower():
-                raise
-            logger.warning(f"Could not validate model device: {e}")
-        
         logger.info(f"Generating image with {steps} steps")
         
         # Handle prompt rewriting if enabled
@@ -891,27 +865,6 @@ class HunyuanImage3GenerateLarge:
     def generate_large(self, model, prompt, seed, steps, resolution, guidance_scale, cpu_offload=True,
                       enable_prompt_rewrite=False, rewrite_style="none", api_key="",
                       api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat"):
-        
-        # Validate model has valid device placement before generation
-        try:
-            has_valid_device = False
-            for param in model.parameters():
-                if param.device.type == 'cuda' and param.device.index is not None:
-                    has_valid_device = True
-                    break
-                elif param.device.type == 'cpu' or param.device.index is None:
-                    break
-            
-            if not has_valid_device:
-                raise RuntimeError(
-                    "Model has invalid device placement (likely cleared by Unload node). "
-                    "Please ensure the model loader runs before generation in your workflow. "
-                    "The model may have been unloaded by a previous Unload node."
-                )
-        except Exception as e:
-            if "invalid device" in str(e).lower() or "cleared by unload" in str(e).lower():
-                raise
-            logger.warning(f"Could not validate model device: {e}")
         
         logger.info("=" * 60)
         logger.info("LARGE IMAGE GENERATION MODE")
