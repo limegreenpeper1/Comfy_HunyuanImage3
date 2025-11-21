@@ -128,6 +128,12 @@ class HunyuanImage3QuantizedLoader:
     RETURN_TYPES = ("HUNYUAN_MODEL",)
     FUNCTION = "load_model"
     CATEGORY = "HunyuanImage3"
+
+    @classmethod
+    def IS_CHANGED(cls, model_name, force_reload=False, unload_signal=None, **kwargs):
+        if force_reload:
+            return float("nan")
+        return model_name
     
     @classmethod
     def _get_available_models(cls):
