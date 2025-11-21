@@ -28,15 +28,20 @@ from .hunyuan_quantized_nodes import NODE_DISPLAY_NAME_MAPPINGS as QUANTIZED_DIS
 from .hunyuan_full_bf16_nodes import NODE_CLASS_MAPPINGS as FULL_MAPPINGS
 from .hunyuan_full_bf16_nodes import NODE_DISPLAY_NAME_MAPPINGS as FULL_DISPLAY_MAPPINGS
 
+from .hunyuan_api_nodes import NODE_CLASS_MAPPINGS as API_MAPPINGS
+from .hunyuan_api_nodes import NODE_DISPLAY_NAME_MAPPINGS as API_DISPLAY_MAPPINGS
+
 # Combine all mappings
 NODE_CLASS_MAPPINGS = {
     **QUANTIZED_MAPPINGS,
     **FULL_MAPPINGS,
+    **API_MAPPINGS,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     **QUANTIZED_DISPLAY_MAPPINGS,
     **FULL_DISPLAY_MAPPINGS,
+    **API_DISPLAY_MAPPINGS,
 }
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']

@@ -1,0 +1,6 @@
+[API]
+# DeepSeek API Configuration
+# Get key: https://platform.deepseek.com/api_keys
+api_key = 
+api_url = https://api.deepseek.com/v1/chat/completions
+model_name = deepseek-chat

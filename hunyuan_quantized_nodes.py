@@ -41,6 +41,7 @@ from .hunyuan_shared import (
     ensure_model_on_device,
     patch_dynamic_cache_dtype,
 )
+from .hunyuan_api_config import get_api_config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -377,11 +378,9 @@ class HunyuanImage3Generate:
       * en_recaption: Structured, detail-rich professional expansion (recommended)
       * en_think_recaption: Advanced with thinking phase + detailed expansion
     
-    API Setup (DeepSeek example):
-    - Get key: https://platform.deepseek.com/api_keys
-    - Add credits: https://platform.deepseek.com/top_up
-    - Default URL: https://api.deepseek.com/v1/chat/completions
-    - Model: deepseek-chat
+    API Setup:
+    - Configure API key in api_config.ini or environment variables (HUNYUAN_API_KEY)
+    - See api_config.ini.example for details
     """
     
     @classmethod
@@ -398,7 +397,7 @@ class HunyuanImage3Generate:
             "optional": {
                 "enable_prompt_rewrite": ("BOOLEAN", {"default": False}),
                 "rewrite_style": (["none", "en_recaption", "en_think_recaption"], {"default": "none"}),
-                "api_key": ("STRING", {"default": "", "placeholder": "sk-... (Optional, requires payment)"}),
+                # api_key removed for security, use api_config.ini or env vars
                 "api_url": ("STRING", {"default": "https://api.deepseek.com/v1/chat/completions"}),
                 "model_name": ("STRING", {"default": "deepseek-chat"}),
             }
@@ -410,7 +409,7 @@ class HunyuanImage3Generate:
     CATEGORY = "HunyuanImage3"
     
     def generate(self, model, prompt, seed, steps, resolution, guidance_scale, 
-                 enable_prompt_rewrite=False, rewrite_style="none", api_key="", 
+                 enable_prompt_rewrite=False, rewrite_style="none", 
                  api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat"):
         # Validate model has valid device placement before generation
         try:
@@ -440,24 +439,37 @@ class HunyuanImage3Generate:
         rewritten_prompt = prompt
         status_message = "Generation complete"
         
-        if enable_prompt_rewrite and rewrite_style != "none" and api_key:
-            try:
-                logger.info(f"Rewriting prompt using LLM API (style: {rewrite_style})...")
-                api_config = {
-                    "url": api_url,
-                    "key": api_key,
-                    "model": model_name
-                }
-                prompt = self._rewrite_prompt_with_llm(prompt, rewrite_style, api_config)
-                rewritten_prompt = prompt
-                logger.info(f"Original prompt: {original_prompt[:80]}...")
-                logger.info(f"Rewritten prompt: {prompt[:80]}...")
-                status_message = f"Prompt rewritten using {rewrite_style}"
-            except Exception as e:
-                logger.warning(f"Prompt rewriting failed: {e}, using original prompt")
-                prompt = original_prompt
-                rewritten_prompt = original_prompt
-                status_message = f"Prompt rewriting failed: {str(e)[:100]}"
+        if enable_prompt_rewrite and rewrite_style != "none":
+            # Get API config
+            config = get_api_config()
+            api_key = config.get("api_key")
+            
+            # Use provided URL/model if they differ from default, otherwise prefer config
+            # Actually, the inputs have defaults. If user didn't change them, we might want to use config.
+            # But here we just use what's passed, or fallback to config if passed is default?
+            # Simpler: Use passed values for URL/Model, but Key comes from config.
+            
+            if api_key:
+                try:
+                    logger.info(f"Rewriting prompt using LLM API (style: {rewrite_style})...")
+                    api_config = {
+                        "url": api_url,
+                        "key": api_key,
+                        "model": model_name
+                    }
+                    prompt = self._rewrite_prompt_with_llm(prompt, rewrite_style, api_config)
+                    rewritten_prompt = prompt
+                    logger.info(f"Original prompt: {original_prompt[:80]}...")
+                    logger.info(f"Rewritten prompt: {prompt[:80]}...")
+                    status_message = f"Prompt rewritten using {rewrite_style}"
+                except Exception as e:
+                    logger.warning(f"Prompt rewriting failed: {e}, using original prompt")
+                    prompt = original_prompt
+                    rewritten_prompt = original_prompt
+                    status_message = f"Prompt rewriting failed: {str(e)[:100]}"
+            else:
+                logger.warning("Prompt rewrite enabled but no API key found in config/env.")
+                status_message = "Prompt rewrite skipped (missing API key)"
         else:
             status_message = "Using original prompt (no rewriting)"
         
@@ -868,7 +880,7 @@ class HunyuanImage3GenerateLarge:
             "optional": {
                 "enable_prompt_rewrite": ("BOOLEAN", {"default": False}),
                 "rewrite_style": (["none", "en_recaption", "en_think_recaption"], {"default": "none"}),
-                "api_key": ("STRING", {"default": "", "placeholder": "sk-... (Optional, requires payment)"}),
+                # api_key removed for security, use api_config.ini or env vars
                 "api_url": ("STRING", {"default": "https://api.deepseek.com/v1/chat/completions"}),
                 "model_name": ("STRING", {"default": "deepseek-chat"}),
             }
@@ -903,7 +915,7 @@ class HunyuanImage3GenerateLarge:
         return options
     
     def generate_large(self, model, prompt, seed, steps, resolution, guidance_scale, cpu_offload=True,
-                      enable_prompt_rewrite=False, rewrite_style="none", api_key="",
+                      enable_prompt_rewrite=False, rewrite_style="none",
                       api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat"):
         
         # Validate model has valid device placement before generation
@@ -931,6 +943,40 @@ class HunyuanImage3GenerateLarge:
         logger.info("LARGE IMAGE GENERATION MODE")
         logger.info(f"CPU Offload: {'Enabled' if cpu_offload else 'Disabled'}")
         logger.info("=" * 60)
+        
+        # Handle prompt rewriting if enabled
+        original_prompt = prompt
+        rewritten_prompt = prompt
+        status_message = "Generation complete"
+        
+        if enable_prompt_rewrite and rewrite_style != "none":
+            # Get API config
+            config = get_api_config()
+            api_key = config.get("api_key")
+            
+            if api_key:
+                try:
+                    logger.info(f"Rewriting prompt using LLM API (style: {rewrite_style})...")
+                    api_config = {
+                        "url": api_url,
+                        "key": api_key,
+                        "model": model_name
+                    }
+                    prompt = self._rewrite_prompt_with_llm(prompt, rewrite_style, api_config)
+                    rewritten_prompt = prompt
+                    logger.info(f"Original prompt: {original_prompt[:80]}...")
+                    logger.info(f"Rewritten prompt: {prompt[:80]}...")
+                    status_message = f"Prompt rewritten using {rewrite_style}"
+                except Exception as e:
+                    logger.warning(f"Prompt rewriting failed: {e}, using original prompt")
+                    prompt = original_prompt
+                    rewritten_prompt = original_prompt
+                    status_message = f"Prompt rewriting failed: {str(e)[:100]}"
+            else:
+                logger.warning("Prompt rewrite enabled but no API key found in config/env.")
+                status_message = "Prompt rewrite skipped (missing API key)"
+        else:
+            status_message = "Using original prompt (no rewriting)"
         
         # Temporarily enable CPU offload for this generation if requested
         original_config = None
