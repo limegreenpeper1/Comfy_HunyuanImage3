@@ -112,14 +112,35 @@ python hunyuan_quantize_nf4.py \
 
 ### Advanced: Prompt Rewriting
 
+**✨ Feature**: Uses official HunyuanImage-3.0 system prompts to professionally expand your prompts for better results.
+
+**⚠️ Note**: Requires a paid LLM API. This feature is optional - you can use the nodes without it.
+
+**Supported APIs** (any OpenAI-compatible endpoint):
+- DeepSeek (default, recommended for cost)
+- OpenAI GPT-4/GPT-3.5
+- Claude (via OpenAI-compatible proxy)
+- Local LLMs (via LM Studio, Ollama with OpenAI API)
+
+**Setup (Secure)**:
+1. Rename `api_config.ini.example` to `api_config.ini` in the custom node folder.
+2. Add your API key to the file:
+   ```ini
+   [API]
+   api_key = sk-your-key-here
+   ```
+3. Alternatively, set environment variables: `HUNYUAN_API_KEY`, `HUNYUAN_API_URL`.
+
+**Usage**:
+- **Option 1 (Integrated)**: Enable `enable_prompt_rewrite` in the Generate node.
+- **Option 2 (Standalone)**: Use the **Hunyuan Prompt Rewriter** node to rewrite prompts before passing them to any model.
+
 ```
-┌─────────────────────────────────┐
-│ Hunyuan 3 Generate              │
-│  prompt: "dog running"          │
-│  enable_prompt_rewrite: True    │
-│  rewrite_style: universal       │
-│  deepseek_api_key: "sk-..."    │
-└─────────────────────────────────┘
+┌─────────────────────────┐      ┌─────────────────────────┐
+│ Hunyuan Prompt Rewriter │      │ Hunyuan 3 Generate      │
+│  prompt: "dog running"  │ ───► │  prompt: (rewritten)    │
+│  rewrite_style: ...     │      │  ...                    │
+└─────────────────────────┘      └─────────────────────────┘
 ```
 
 **Result**: Automatically expands to:
@@ -195,13 +216,29 @@ Settings:
 - Claude (via OpenAI-compatible proxy)
 - Local LLMs (via LM Studio, Ollama with OpenAI API)
 
-**Setup Example (DeepSeek)**:
-1. **Get API key**: https://platform.deepseek.com/api_keys
-2. **Add credits**: https://platform.deepseek.com/top_up (~$1 lasts a long time)
-3. Configure in generation node:
-   - `api_key`: Your API key (sk-...)
-   - `api_url`: https://api.deepseek.com/v1/chat/completions (default)
-   - `model_name`: deepseek-chat (default)
+**Setup (Secure)**:
+1. Rename `api_config.ini.example` to `api_config.ini` in the custom node folder.
+2. Add your API key to the file:
+   ```ini
+   [API]
+   api_key = sk-your-key-here
+   ```
+3. Alternatively, set environment variables: `HUNYUAN_API_KEY`, `HUNYUAN_API_URL`.
+
+**Usage**:
+- **Option 1 (Integrated)**: Enable `enable_prompt_rewrite` in the Generate node.
+- **Option 2 (Standalone)**: Use the **Hunyuan Prompt Rewriter** node to rewrite prompts before passing them to any model.
+
+```
+┌─────────────────────────┐      ┌─────────────────────────┐
+│ Hunyuan Prompt Rewriter │      │ Hunyuan 3 Generate      │
+│  prompt: "dog running"  │ ───► │  prompt: (rewritten)    │
+│  rewrite_style: ...     │      │  ...                    │
+└─────────────────────────┘      └─────────────────────────┘
+```
+
+**Result**: Automatically expands to:
+> "An energetic brown and white border collie running across a sun-drenched meadow filled with wildflowers, motion blur on legs showing speed, golden hour lighting, shallow depth of field, professional photography, high detail, 8k quality"
 
 **Rewrite Styles** (Official HunyuanImage-3.0 system prompts):
 - **none**: (Default) Use your original prompt without modification
