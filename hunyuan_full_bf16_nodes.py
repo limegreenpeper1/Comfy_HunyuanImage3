@@ -145,7 +145,7 @@ class HunyuanImage3FullLoader:
                 logger.warning("Falling back to legacy load args due to: %s", exc)
                 model = AutoModelForCausalLM.from_pretrained(
                     model_path_str,
-                    device_map={'': 0},
+                    device_map="auto",
                     trust_remote_code=True,
                     torch_dtype=torch.bfloat16,
                 )
@@ -266,7 +266,7 @@ class HunyuanImage3FullGPULoader:
                     reserve_bytes / 1024**3
                 )
             
-            device_map = {"": cuda_index}
+            device_map = "auto"
             max_memory = {device_key: usable_mem, "cpu": "10GiB"}
             logger.info(
                 "Requesting single-GPU load on %s: %.2f GiB total, %.2f GiB currently used, %.2f GiB available for model (%.2f GiB reserved for inference)",
@@ -297,14 +297,14 @@ class HunyuanImage3FullGPULoader:
                 )
             except TypeError as exc:
                 logger.warning("Falling back to legacy load args due to: %s", exc)
-                fallback_map = {"":
-0} if target_device.type == "cuda" else {"":
-"cpu"}
+                # Fallback also needs to respect memory limits if possible
+                fallback_map = "auto" if target_device.type == "cuda" else {"": "cpu"}
                 model = AutoModelForCausalLM.from_pretrained(
                     model_path_str,
                     device_map=fallback_map,
                     trust_remote_code=True,
                     torch_dtype=torch.bfloat16,
+                    max_memory=max_memory if target_device.type == "cuda" else None,
                 )
 
             logger.info("Loading tokenizer...")
