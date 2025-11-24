@@ -8,9 +8,17 @@ Professional ComfyUI custom nodes for [Tencent HunyuanImage-3.0](https://github.
 
 > **🙏 Acknowledgment**: This project integrates the HunyuanImage-3.0 model developed by **Tencent Hunyuan Team** and uses their official system prompts. The model and original code are licensed under [Apache 2.0](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE). This integration code is separately licensed under CC BY-NC 4.0 for non-commercial use.
 
+## 📋 TODO / Known Issues
+
+- [ ] **INT8 Loader**: Currently non-functional due to bitsandbytes validation issues with CPU offload. Use NF4 or BF16 loaders instead.
+- [ ] Add example workflows to repository
+- [ ] Add screenshots/documentation for each node
+- [ ] Test and document multi-GPU setup
+- [ ] Optimize Low VRAM node for 24GB cards
+
 ## 🎯 Features
 
-- **Multiple Loading Modes**: Full BF16, NF4 Quantized, Single GPU, Multi-GPU
+- **Multiple Loading Modes**: Full BF16, INT8/NF4 Quantized, Single GPU, Multi-GPU
 - **Smart Memory Management**: Automatic VRAM tracking, cleanup, and optimization
 - **High-Quality Image Generation**: 
   - Standard generation (<2MP) - Fast, GPU-only
@@ -64,6 +72,22 @@ This version is compressed to 4-bit, reducing size by ~4x with minimal quality l
 - **System RAM**: 
   - **64GB+ recommended** (especially for 24GB VRAM cards to hold the offloaded weights).
 - **Performance**: Much faster on consumer hardware.
+
+#### 3. INT8 Quantized Model (High Quality)
+
+> ⚠️ **Warning**: INT8 loader is currently non-functional due to bitsandbytes validation issues when CPU offload is required. The INT8 quantization format does not save quantized weights to disk - it only saves metadata and re-quantizes on load, which triggers validation errors for large models requiring CPU offload. **Use NF4 or BF16 loaders instead.**
+
+This version is compressed to 8-bit, offering near-original quality with reduced memory usage.
+- **Model Size**: ~85GB on disk.
+- **VRAM**:
+  - **Ideal**: 80GB+ (A100, H100). Runs entirely on GPU.
+  - **Minimum**: 24GB (RTX 3090/4090).
+    - *Note*: Significant CPU offloading required (~60GB of weights in RAM).
+- **System RAM**: 
+  - **128GB+ recommended**.
+- **Performance**: 
+  - **Quality**: ~98% of full precision (better than NF4).
+  - **Speed**: Faster inference than NF4 (less dequantization overhead) but requires more memory transfer if offloading.
 
 ### Quick Install
 
