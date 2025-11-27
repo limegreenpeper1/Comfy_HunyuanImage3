@@ -25,6 +25,7 @@ Note: HunyuanImage-3.0 model is subject to Tencent's Apache 2.0 license.
 import logging
 from typing import Optional
 
+import psutil
 import torch
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,8 @@ _SDPA_PATCHED = False
 _ORIGINAL_SDPA = None
 _GELU_PATCHED = False
 _ORIGINAL_GELU = None
+_SILU_PATCHED = False
+_ORIGINAL_SILU = None
 _SCATTER_PATCHED = False
 _ORIGINAL_SCATTER = None
 _ORIGINAL_SCATTER_INPLACE = None
@@ -41,6 +44,41 @@ _ORIGINAL_INDEX_COPY = None
 _ORIGINAL_INDEX_COPY_INPLACE = None
 _DYNAMIC_CACHE_PATCHED = False
 _ORIGINAL_DYNAMIC_CACHE_UPDATE = None
+_DTYPE_HOOKS_INSTALLED = False
+
+
+def install_dtype_harmonization_hooks(model) -> None:
+    """Install forward hooks to harmonize dtypes across quantized and non-quantized layers."""
+    global _DTYPE_HOOKS_INSTALLED
+    if _DTYPE_HOOKS_INSTALLED:
+        return
+    
+    def _harmonize_dtype_hook(module, args, kwargs, output):
+        """Ensure output tensors are in float32/bfloat16, not int8."""
+        if isinstance(output, torch.Tensor):
+            # If output is int8 from a quantized layer, convert to bfloat16
+            if output.dtype == torch.int8:
+                output = output.to(dtype=torch.bfloat16)
+            # If output is uint8, convert to float32
+            elif output.dtype == torch.uint8:
+                output = output.to(dtype=torch.float32)
+        elif isinstance(output, (tuple, list)):
+            # Handle tuple/list outputs
+            output = type(output)(
+                _harmonize_dtype_hook(module, args, kwargs, item) if isinstance(item, torch.Tensor) else item
+                for item in output
+            )
+        return output
+    
+    # Register hooks on all modules
+    hook_count = 0
+    for name, module in model.named_modules():
+        if len(list(module.children())) == 0:  # Only leaf modules
+            module.register_forward_hook(_harmonize_dtype_hook, with_kwargs=True)
+            hook_count += 1
+    
+    _DTYPE_HOOKS_INSTALLED = True
+    logger.info(f"Installed dtype harmonization hooks on {hook_count} modules")
 
 
 def patch_scaled_dot_product_attention() -> None:
@@ -69,20 +107,49 @@ def patch_scaled_dot_product_attention() -> None:
 
 
 def patch_gelu_uint8() -> None:
-    """Promote stray uint8 activations to float before GELU."""
+    """Promote stray uint8/int8 activations to float before GELU."""
     global _GELU_PATCHED, _ORIGINAL_GELU
     if _GELU_PATCHED:
         return
     _ORIGINAL_GELU = torch.nn.functional.gelu
 
     def _patched_gelu(input, approximate='none'):
-        if isinstance(input, torch.Tensor) and input.dtype == torch.uint8:
-            input = input.to(dtype=torch.float32)
+        if isinstance(input, torch.Tensor):
+            # Handle quantized types (uint8, int8, etc.)
+            if input.dtype in (torch.uint8, torch.int8):
+                input = input.to(dtype=torch.float32)
+            # Handle bitsandbytes quantized tensors with quant_state
+            elif hasattr(input, 'quant_state'):
+                # This is a quantized tensor - it should have been dequantized before GELU
+                # Force dequantization by converting to float
+                input = input.to(dtype=torch.float32)
         return _ORIGINAL_GELU(input, approximate=approximate)
 
     torch.nn.functional.gelu = _patched_gelu  # type: ignore[assignment]
     _GELU_PATCHED = True
-    logger.info("Patched GELU to promote uint8 activations to float32")
+    logger.info("Patched GELU to promote uint8/int8/quantized activations to float32")
+
+
+def patch_silu_uint8() -> None:
+    """Promote stray uint8/int8 activations to float before SiLU."""
+    global _SILU_PATCHED, _ORIGINAL_SILU
+    if _SILU_PATCHED:
+        return
+    _ORIGINAL_SILU = torch.nn.functional.silu
+
+    def _patched_silu(input, inplace=False):
+        if isinstance(input, torch.Tensor):
+            # Handle quantized types (uint8, int8, etc.)
+            if input.dtype in (torch.uint8, torch.int8):
+                input = input.to(dtype=torch.float32)
+            # Handle bitsandbytes quantized tensors with quant_state
+            elif hasattr(input, 'quant_state'):
+                input = input.to(dtype=torch.float32)
+        return _ORIGINAL_SILU(input, inplace=inplace)
+
+    torch.nn.functional.silu = _patched_silu  # type: ignore[assignment]
+    _SILU_PATCHED = True
+    logger.info("Patched SiLU to promote uint8/int8/quantized activations to float32")
 
 
 def patch_scatter_dtype() -> None:
@@ -226,6 +293,7 @@ def ensure_model_on_device(model, device: torch.device, skip_quantized_params: b
 
     patch_scaled_dot_product_attention()
     patch_gelu_uint8()
+    patch_silu_uint8()
     patch_scatter_dtype()
     patch_index_copy_dtype()
     patch_dynamic_cache_dtype()
@@ -345,6 +413,19 @@ class HunyuanModelCache:
                 cls._cached_model = None
                 cls._cached_path = None
                 
+                # Remove accelerate hooks if present
+                hook = getattr(model_to_clear, '_cpu_offload_hook', None)
+                if hook is not None:
+                    try:
+                        hook.remove()
+                    except Exception as hook_err:
+                        logger.warning("Failed to remove cpu_offload hook: %s", hook_err)
+                if hasattr(model_to_clear, '_forced_device'):
+                    try:
+                        delattr(model_to_clear, '_forced_device')
+                    except Exception:
+                        pass
+
                 # Now clean up the model
                 if hasattr(model_to_clear, 'cpu'):
                     model_to_clear.cpu()
@@ -411,6 +492,96 @@ class HunyuanImage3Unload:
         # Return a signal that changes to force downstream nodes to re-evaluate if needed
         import time
         return (cleared, float(time.time()))
+
+
+class MemoryTracker:
+    """Track system RAM and GPU VRAM usage during a generation run."""
+
+    def __init__(self, device_index: int = 0):
+        self.process = psutil.Process()
+        self.device_index = device_index if torch.cuda.is_available() else None
+        self.ram_start_bytes = self.process.memory_info().rss
+        self._finished_stats = None
+
+        if self.device_index is not None:
+            torch.cuda.reset_peak_memory_stats(self.device_index)
+            free_bytes, total_bytes = torch.cuda.mem_get_info(self.device_index)
+            self.vram_start_bytes = total_bytes - free_bytes
+            self.vram_total_bytes = total_bytes
+        else:
+            self.vram_start_bytes = None
+            self.vram_total_bytes = None
+
+    @staticmethod
+    def _bytes_to_gb(value: Optional[int]) -> Optional[float]:
+        if value is None:
+            return None
+        return value / 1024**3
+
+    @staticmethod
+    def _extract_peak_ram(mem_info) -> int:
+        candidates = []
+        for attr in ("peak_wset", "peak_rss", "peak_pagefile", "peak_pagefaults", "rss"):
+            value = getattr(mem_info, attr, None)
+            if isinstance(value, (int, float)) and value > 0:
+                candidates.append(int(value))
+        return max(candidates) if candidates else mem_info.rss
+
+    def finish(self) -> dict:
+        if self._finished_stats is not None:
+            return self._finished_stats
+
+        mem_end = self.process.memory_info()
+        ram_end_bytes = mem_end.rss
+        ram_peak_bytes = max(self._extract_peak_ram(mem_end), self.ram_start_bytes, ram_end_bytes)
+
+        vram_end_bytes = None
+        vram_peak_bytes = None
+        if self.device_index is not None:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(self.device_index)
+            vram_end_bytes = total_bytes - free_bytes
+            vram_peak_bytes = torch.cuda.max_memory_reserved(self.device_index)
+
+        stats = {
+            "ram_start_gb": self._bytes_to_gb(self.ram_start_bytes),
+            "ram_end_gb": self._bytes_to_gb(ram_end_bytes),
+            "ram_peak_gb": self._bytes_to_gb(ram_peak_bytes),
+            "vram_start_gb": self._bytes_to_gb(self.vram_start_bytes),
+            "vram_end_gb": self._bytes_to_gb(vram_end_bytes),
+            "vram_peak_gb": self._bytes_to_gb(vram_peak_bytes),
+            "vram_total_gb": self._bytes_to_gb(self.vram_total_bytes),
+        }
+
+        self._finished_stats = stats
+        return stats
+
+    def start_snapshot(self) -> dict:
+        return {
+            "ram_start_gb": self._bytes_to_gb(self.ram_start_bytes),
+            "vram_start_gb": self._bytes_to_gb(self.vram_start_bytes),
+            "vram_total_gb": self._bytes_to_gb(self.vram_total_bytes),
+        }
+
+
+def format_memory_stats(stats: dict) -> str:
+    """Create a short human-readable summary of memory usage."""
+    parts = []
+    peak_vram = stats.get("vram_peak_gb")
+    if peak_vram is not None:
+        parts.append(f"Peak VRAM {peak_vram:.1f}GB")
+
+    vram_start = stats.get("vram_start_gb")
+    vram_end = stats.get("vram_end_gb")
+    if vram_start is not None and vram_end is not None:
+        parts.append(f"VRAM Start {vram_start:.1f}GB → End {vram_end:.1f}GB")
+
+    peak_ram = stats.get("ram_peak_gb")
+    if peak_ram is not None:
+        parts.append(f"Peak RAM {peak_ram:.1f}GB")
+
+    if not parts:
+        return ""
+    return " | ".join(parts)
 
 
 def patch_hunyuan_generate_image(model):

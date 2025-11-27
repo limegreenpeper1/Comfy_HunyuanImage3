@@ -33,13 +33,16 @@ import numpy as np
 import torch
 import folder_paths
 from PIL import Image
-from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig, AutoConfig
+from accelerate import init_empty_weights, infer_auto_device_map
 from comfy.utils import ProgressBar
 
 from .hunyuan_shared import (
     HunyuanImage3Unload,
     HunyuanModelCache,
+    MemoryTracker,
     ensure_model_on_device,
+    format_memory_stats,
     patch_dynamic_cache_dtype,
     patch_hunyuan_generate_image,
 )
@@ -47,6 +50,23 @@ from .hunyuan_api_config import get_api_config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _force_model_device_property(model, device: torch.device) -> None:
+    """Ensure model.device returns a usable accelerator even when accelerate parks params on meta."""
+    cls = model.__class__
+    original_prop = getattr(cls, "device", None)
+    if isinstance(original_prop, property) and not getattr(cls, "_hunyuan_device_prop_patched", False):
+        def _device_getter(self):  # type: ignore[override]
+            forced = getattr(self, "_forced_device", None)
+            if forced is not None:
+                return forced
+            return original_prop.fget(self) if original_prop.fget else torch.device("cpu")
+
+        cls.device = property(_device_getter)  # type: ignore[assignment]
+        cls._hunyuan_device_prop_patched = True  # type: ignore[attr-defined]
+
+    model._forced_device = device  # type: ignore[attr-defined]
 
 
 @lru_cache(maxsize=1)
@@ -127,7 +147,7 @@ class HunyuanImage3QuantizedLoader:
                     "min": 2.0, 
                     "max": 80.0, 
                     "step": 0.5,
-                    "tooltip": "VRAM to leave free. Standard: 6GB. Large images (>2MP) need ~12GB/MP free (use Large Generate node to offload)."
+                    "tooltip": "VRAM to leave free. Standard: 6GB. Large images (>2MP) can eat ~15GB/MP (use Large Generate node to offload)."
                 }),
             },
             "optional": {
@@ -152,8 +172,20 @@ class HunyuanImage3QuantizedLoader:
         available = []
         
         for item in hunyuan_dir.iterdir():
-            if item.is_dir() and (item / "quantization_metadata.json").exists():
-                available.append(item.name)
+            if not item.is_dir():
+                continue
+            meta_path = item / "quantization_metadata.json"
+            if not meta_path.exists():
+                continue
+            try:
+                with meta_path.open('r') as meta_file:
+                    meta = json.load(meta_file)
+                if meta.get("quantization_method") == "bitsandbytes_int8_full":
+                    logger.info("Skipping deprecated INT8-Full checkpoint: %s", item.name)
+                    continue
+            except Exception:
+                pass
+            available.append(item.name)
         
         # Sort to prioritize NF4 models for this loader
         available.sort(key=lambda x: 0 if "nf4" in x.lower() else 1)
@@ -391,7 +423,7 @@ class HunyuanImage3Int8Loader:
                     "min": 2.0, 
                     "max": 80.0, 
                     "step": 0.5,
-                    "tooltip": "VRAM to leave free. Standard: 6GB. Large images (>2MP) need ~12GB/MP free (use Large Generate node to offload)."
+                    "tooltip": "VRAM to leave free. Standard: 6GB. Large images (>2MP) can eat ~15GB/MP (use Large Generate node to offload)."
                 }),
             },
             "optional": {
@@ -669,6 +701,601 @@ class HunyuanImage3Int8Loader:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 logger.info("Cleared CUDA cache (no model was cached)")
+            raise
+
+    @classmethod
+    def _apply_dtype_patches(cls):
+        logger.info("Applying dtype compatibility patches...")
+        patch_dynamic_cache_dtype()
+
+
+class HunyuanImage3NF4LoaderLowVRAMBudget:
+    """NF4 loader variant with explicit GPU budget controls for 24-32GB cards."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_name": (cls._get_available_models(),),
+                "force_reload": ("BOOLEAN", {"default": False}),
+                "reserve_memory_gb": ("FLOAT", {
+                    "default": 6.0,
+                    "min": 2.0,
+                    "max": 20.0,
+                    "step": 0.5,
+                    "tooltip": "Fallback headroom if GPU budget <= 0. Leave ≥6GB so auto mode keeps inference breathing room."
+                }),
+                "gpu_memory_target_gb": ("FLOAT", {
+                    "default": 18.0,
+                    "min": 4.0,
+                    "max": 128.0,
+                    "step": 0.5,
+                    "tooltip": "Approximate GPU budget for NF4 weights (GB). 18‑20GB for 24GB GPUs, 26‑28GB for 32GB GPUs."
+                }),
+            },
+            "optional": {
+                "unload_signal": ("*", {"default": None}),
+            }
+        }
+
+    RETURN_TYPES = ("HUNYUAN_MODEL",)
+    FUNCTION = "load_model"
+    CATEGORY = "HunyuanImage3"
+
+    @classmethod
+    def IS_CHANGED(cls, model_name, force_reload=False, unload_signal=None, **kwargs):
+        if force_reload:
+            return float("nan")
+        return model_name
+
+    @classmethod
+    def _get_available_models(cls):
+        models_dir = folder_paths.models_dir
+        hunyuan_dir = Path(models_dir)
+        available = []
+
+        for item in hunyuan_dir.iterdir():
+            if item.is_dir() and (item / "quantization_metadata.json").exists():
+                available.append(item.name)
+
+        available.sort(key=lambda x: 0 if "nf4" in x.lower() else 1)
+        return available if available else ["HunyuanImage-3-NF4"]
+
+    def load_model(self, model_name, force_reload=False, unload_signal=None,
+                  reserve_memory_gb=6.0, gpu_memory_target_gb=18.0):
+        model_path = Path(folder_paths.models_dir) / model_name
+        model_path_str = str(model_path)
+
+        if force_reload:
+            logger.info("force_reload=True, clearing cache and reloading model...")
+            HunyuanModelCache.clear()
+            cached = None
+        else:
+            cached = HunyuanModelCache.get(model_path_str)
+
+        if cached is not None:
+            try:
+                if not hasattr(cached, 'generate_image'):
+                    logger.warning("Cached model invalid, clearing cache and reloading...")
+                    HunyuanModelCache.clear()
+                    cached = None
+                else:
+                    has_valid_device = False
+                    try:
+                        for param in cached.parameters():
+                            if param.device.type == 'cuda' and param.device.index is not None:
+                                has_valid_device = True
+                                break
+                            elif param.device.type == 'cpu' or param.device.index is None:
+                                break
+                    except Exception:
+                        has_valid_device = False
+
+                    if not has_valid_device and cached is not None:
+                        logger.warning("Cached model has invalid device placement, clearing cache and reloading...")
+                        HunyuanModelCache.clear()
+                        cached = None
+                    elif cached is not None:
+                        logger.info("Using cached NF4 Low VRAM model")
+                        self._apply_dtype_patches()
+                        patch_hunyuan_generate_image(cached)
+                        ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=True)
+                        return (cached,)
+            except Exception as e:
+                logger.warning(f"Failed to validate cached model: {e}. Clearing cache and reloading...")
+                HunyuanModelCache.clear()
+                cached = None
+
+        max_memory = None
+        target_gpu_gb = None
+        total_vram_gb = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            free_vram, total_vram = torch.cuda.mem_get_info(0)
+            total_vram_gb = total_vram / 1024**3
+            logger.info(
+                f"VRAM before load: {(total_vram-free_vram)/1024**3:.2f}GB used / {total_vram/1024**3:.2f}GB total"
+                f" ({free_vram/1024**3:.2f}GB free)"
+            )
+
+            if gpu_memory_target_gb and gpu_memory_target_gb > 0:
+                desired_budget = min(gpu_memory_target_gb, total_vram_gb)
+                reserve_cap = max(reserve_memory_gb, 0.0)
+                target_gpu_gb = max(min(desired_budget, total_vram_gb - reserve_cap), 8.0)
+                if target_gpu_gb < desired_budget:
+                    logger.info(
+                        "  Clamped GPU budget from %.1fGB to %.1fGB to leave %.1fGB headroom",
+                        desired_budget,
+                        target_gpu_gb,
+                        reserve_cap,
+                    )
+            else:
+                reserve_bytes = int(max(reserve_memory_gb, 0.0) * 1024**3)
+                target_gpu_gb = max((free_vram - reserve_bytes) / 1024**3, 8.0)
+
+            max_vram_for_model = max(int(target_gpu_gb * 1024**3), int(8 * 1024**3))
+            max_memory = {0: max_vram_for_model, "cpu": "100GiB"}
+
+            headroom_gb = max(total_vram_gb - target_gpu_gb, 0.0)
+            logger.info(
+                "LOW VRAM MODE: Targeting %.1fGB GPU budget (total %.1fGB, headroom %.1fGB)",
+                target_gpu_gb,
+                total_vram_gb,
+                headroom_gb,
+            )
+            if gpu_memory_target_gb and gpu_memory_target_gb > 0:
+                logger.info("  Reserve slider only kicks in if the GPU target would leave <%.1fGB free", max(reserve_memory_gb, 0.0))
+            else:
+                logger.info("  GPU budget derived from reserve slider (%.1fGB)", reserve_memory_gb)
+            logger.info("  Excess weights will be kept in system RAM via accelerate")
+        else:
+            max_memory = None
+            logger.warning("CUDA not available, loading model to CPU")
+
+        logger.info(f"Loading {model_name} (NF4 Low VRAM Budget)")
+
+        skip_modules = [
+            "vae", "model.vae", "vae.decoder", "vae.encoder",
+            "autoencoder", "model.autoencoder", "autoencoder.decoder", "autoencoder.encoder",
+            "patch_embed", "model.patch_embed",
+            "final_layer", "model.final_layer",
+            "time_embed", "model.time_embed", "time_embed_2", "model.time_embed_2",
+            "timestep_emb", "model.timestep_emb",
+            "attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.o_proj",
+            "attn.qkv_proj", "attn.out_proj",
+            "self_attn", "cross_attn",
+            "norm", "model.norm",
+            "lm_head", "model.lm_head",
+            "embed_tokens", "model.embed_tokens",
+        ]
+
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            modules_to_not_convert=skip_modules,
+            llm_int8_skip_modules=skip_modules,
+            llm_int8_enable_fp32_cpu_offload=True,
+            keep_in_fp32_modules=skip_modules,
+        )
+
+        model = None
+        try:
+            # Strategy: Calculate custom device map to force NF4 layers to GPU
+            # This prevents bitsandbytes from seeing 4-bit layers on CPU (which causes validation error)
+            logger.info("Calculating custom device map to force NF4 layers to GPU...")
+            config = AutoConfig.from_pretrained(model_path_str, trust_remote_code=True)
+            with init_empty_weights():
+                empty_model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+            
+            device_map = infer_auto_device_map(
+                empty_model,
+                max_memory=max_memory,
+                no_split_module_classes=["HunyuanImage3DecoderLayer"],
+                dtype=torch.bfloat16,
+            )
+            
+            # Force transformer blocks to GPU
+            forced_count = 0
+            for name in list(device_map.keys()):
+                if "model.layers" in name:
+                    device_map[name] = 0
+                    forced_count += 1
+
+            # Critical output modules must stay on GPU or bitsandbytes rejects the map
+            critical_gpu_modules = [
+                "model.ln_f",
+                "ln_f",
+                "lm_head",
+                "model.lm_head",
+                "model.norm",
+            ]
+            critical_forced = 0
+            for module_name in critical_gpu_modules:
+                if module_name in device_map and device_map[module_name] != 0:
+                    device_map[module_name] = 0
+                    critical_forced += 1
+
+            if critical_forced:
+                logger.info("Forced %d critical output modules to GPU to satisfy NF4 requirements", critical_forced)
+            
+            logger.info(f"Forced {forced_count} transformer blocks to GPU to satisfy NF4 requirements")
+
+            safe_device_map = device_map
+            try:
+                non_gpu_entries = [
+                    (name, target)
+                    for name, target in safe_device_map.items()
+                    if target not in (0, "cuda", "cuda:0")
+                ]
+                if non_gpu_entries:
+                    logger.info("Device map contains non-GPU placements:")
+                    for name, target in non_gpu_entries:
+                        logger.info("  %s -> %s", name, target)
+                else:
+                    logger.info("Device map summary: all modules currently mapped to GPU 0")
+            except Exception as exc:
+                logger.warning("Could not summarize device map: %s", exc)
+
+            quant_config_path = Path(model_path_str) / "quantization_config.json"
+            if quant_config_path.exists():
+                try:
+                    with quant_config_path.open("r", encoding="utf-8") as handle:
+                        saved_quant_config = json.load(handle)
+                    logger.info(
+                        "Checkpoint quantization config preview: %s",
+                        {k: saved_quant_config.get(k) for k in sorted(saved_quant_config) if k in {"bnb_4bit_quant_type", "llm_int8_enable_fp32_cpu_offload", "modules_to_not_convert", "llm_int8_skip_modules"}}
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to read checkpoint quantization_config.json: %s", exc)
+
+            load_kwargs = dict(
+                device_map=device_map,
+                quantization_config=quant_config,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+                moe_impl="eager",
+                moe_drop_tokens=True,
+                low_cpu_mem_usage=True,
+            )
+
+            try:
+                model = AutoModelForCausalLM.from_pretrained(model_path_str, **load_kwargs)
+            except TypeError as exc:
+                logger.warning("Falling back to legacy load args due to: %s", exc)
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_path_str,
+                    device_map=device_map,
+                    quantization_config=quant_config,
+                    trust_remote_code=True,
+                    torch_dtype=torch.bfloat16,
+                    low_cpu_mem_usage=True,
+                )
+
+            logger.info("Loading tokenizer...")
+            model.load_tokenizer(model_path_str)
+
+            self._apply_dtype_patches()
+            patch_hunyuan_generate_image(model)
+            model._needs_meta_patch = True
+
+            if hasattr(model, "vae"):
+                target_device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+                logger.info("Ensuring VAE stays in bfloat16 on %s", target_device)
+                model.vae = model.vae.to(device=target_device, dtype=torch.bfloat16)
+                for param in model.vae.parameters():
+                    if hasattr(param, "quant_state"):
+                        continue
+                    move_kwargs = {"device": target_device}
+                    if torch.is_floating_point(param):
+                        move_kwargs["dtype"] = torch.bfloat16
+                    param.data = param.data.to(**move_kwargs)
+                for buffer in model.vae.buffers():
+                    if buffer.device.type != "meta":
+                        move_kwargs = {"device": target_device}
+                        if torch.is_floating_point(buffer):
+                            move_kwargs["dtype"] = torch.bfloat16
+                        buffer.data = buffer.data.to(**move_kwargs)
+
+                logger.info("✓ VAE configured in full precision")
+
+            logger.info("Verifying device placement...")
+            if torch.cuda.is_available():
+                model._loader_gpu_budget_gb = target_gpu_gb
+                model._loader_reserve_gb = max(total_vram_gb - target_gpu_gb, 0.0)
+            ensure_model_on_device(model, torch.device("cuda:0"), skip_quantized_params=True)
+
+            HunyuanModelCache.store(model_path_str, model)
+
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated(0) / 1024**3
+                reserved = torch.cuda.memory_reserved(0) / 1024**3
+                free_after, _ = torch.cuda.mem_get_info(0)
+                logger.info("✓ Low VRAM NF4 model loaded")
+                logger.info(f"  VRAM: Allocated {allocated:.2f}GB, Reserved {reserved:.2f}GB, Free {free_after/1024**3:.2f}GB")
+
+            logger.info("✓ Model ready for generation with Low VRAM Budget node")
+            return (model,)
+
+        except Exception as e:
+            logger.error("Failed to load Low VRAM NF4 model: %s", e)
+            if model is not None:
+                try:
+                    del model
+                except Exception:
+                    pass
+            HunyuanModelCache.clear()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            raise
+
+    @classmethod
+    def _apply_dtype_patches(cls):
+        logger.info("Applying dtype compatibility patches...")
+        patch_dynamic_cache_dtype()
+
+
+class HunyuanImage3Int8LoaderBudget:
+    """INT8 loader variant with GPU budget and telemetry-friendly metadata."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_name": (cls._get_available_models(),),
+                "force_reload": ("BOOLEAN", {"default": False}),
+                "reserve_memory_gb": ("FLOAT", {
+                    "default": 20.0,
+                    "min": 5.0,
+                    "max": 80.0,
+                    "step": 0.5,
+                    "tooltip": "VRAM to reserve for inference headroom. INT8 needs ~20GB minimum."
+                }),
+                "gpu_memory_target_gb": ("FLOAT", {
+                    "default": 80.0,
+                    "min": 10.0,
+                    "max": 128.0,
+                    "step": 0.5,
+                    "tooltip": "Approximate GPU budget for INT8 weights (GB). 80GB hits the sweet spot on 96GB cards."
+                }),
+            },
+            "optional": {
+                "unload_signal": ("*", {"default": None}),
+            }
+        }
+
+    RETURN_TYPES = ("HUNYUAN_MODEL",)
+    FUNCTION = "load_model"
+    CATEGORY = "HunyuanImage3"
+
+    @classmethod
+    def IS_CHANGED(cls, model_name, force_reload=False, unload_signal=None, **kwargs):
+        if force_reload:
+            return float("nan")
+        return model_name
+
+    @classmethod
+    def _get_available_models(cls):
+        models_dir = folder_paths.models_dir
+        hunyuan_dir = Path(models_dir)
+        available = []
+
+        for item in hunyuan_dir.iterdir():
+            if item.is_dir() and (item / "quantization_metadata.json").exists():
+                available.append(item.name)
+
+        available.sort(key=lambda x: 0 if "int8" in x.lower() else 1)
+        return available if available else ["HunyuanImage-3-INT8"]
+
+    def load_model(self, model_name, force_reload=False, unload_signal=None,
+                  reserve_memory_gb=20.0, gpu_memory_target_gb=80.0):
+        model_path = Path(folder_paths.models_dir) / model_name
+        model_path_str = str(model_path)
+
+        # If force_reload is True, skip cache and reload fresh
+        if force_reload:
+            logger.info("force_reload=True, clearing cache and reloading model...")
+            HunyuanModelCache.clear()
+            cached = None
+        else:
+            cached = HunyuanModelCache.get(model_path_str)
+        
+        if cached is not None:
+            try:
+                # Validate cached model is in a usable state
+                if not hasattr(cached, 'generate_image'):
+                    logger.warning("Cached model is invalid (missing generate_image), clearing cache and reloading...")
+                    HunyuanModelCache.clear()
+                    cached = None
+                else:
+                    # Check if model has valid device placement
+                    has_valid_device = False
+                    try:
+                        # Check a model parameter to see if it has a valid device
+                        for param in cached.parameters():
+                            if param.device.type == 'cuda' and param.device.index is not None:
+                                has_valid_device = True
+                                break
+                            elif param.device.type == 'cpu' or param.device.index is None:
+                                break
+                    except Exception:
+                        has_valid_device = False
+                    
+                    if not has_valid_device and cached is not None:
+                        logger.warning("Cached model has invalid device placement, clearing cache and reloading...")
+                        HunyuanModelCache.clear()
+                        cached = None
+                    elif cached is not None:
+                        logger.info("Using cached INT8 model")
+                        self._apply_dtype_patches()
+                        patch_hunyuan_generate_image(cached)
+                        ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=True)
+                        return (cached,)
+            except Exception as e:
+                logger.warning(f"Failed to validate cached model: {e}. Clearing cache and reloading...")
+                HunyuanModelCache.clear()
+                cached = None
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info(0)
+            logger.info(
+                f"VRAM before load: {(total-free)/1024**3:.2f}GB used / {total/1024**3:.2f}GB total"
+                f" ({free/1024**3:.2f}GB free)"
+            )
+
+        logger.info(f"Loading {model_name} (INT8 Budget)")
+
+        meta_path = Path(folder_paths.models_dir) / model_name / "quantization_metadata.json"
+        is_full_quantization = False
+        if meta_path.exists():
+            try:
+                with open(meta_path, 'r') as f:
+                    meta = json.load(f)
+                is_full_quantization = meta.get("quantization_method") == "bitsandbytes_int8_full"
+                if meta.get("quantization_method") == "bitsandbytes_nf4":
+                    logger.warning(f"⚠️ Model '{model_name}' appears to be NF4 quantized, not INT8")
+            except Exception:
+                pass
+
+        skip_modules = [
+            "vae",
+            "model.vae",
+            "vae.decoder",
+            "vae.encoder",
+            "autoencoder",
+            "model.autoencoder",
+            "autoencoder.decoder",
+            "autoencoder.encoder",
+            "patch_embed",
+            "model.patch_embed",
+            "final_layer",
+            "model.final_layer",
+            "time_embed",
+            "model.time_embed",
+            "time_embed_2",
+            "model.time_embed_2",
+            "timestep_emb",
+            "model.timestep_emb",
+            # Critical: exclude attention projections to prevent corruption
+            "attn.q_proj",
+            "attn.k_proj",
+            "attn.v_proj",
+            "attn.o_proj",
+            "attn.qkv_proj",
+            "attn.out_proj",
+            "self_attn",
+            "cross_attn",
+        ]
+
+        if is_full_quantization:
+            raise RuntimeError(
+                "INT8-Full checkpoints are deprecated. Please re-quantize with hunyuan_quantize_int8.py "
+                "to produce selective INT8 weights before using the budget loader."
+            )
+
+        logger.info("Detected INT8 selective quantization")
+        logger.info("  Critical layers already bfloat16 on disk")
+
+        quant_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_skip_modules=skip_modules if skip_modules else None,
+            llm_int8_enable_fp32_cpu_offload=True,
+        )
+
+        model = None
+        target_gpu_gb = None
+        total_vram_gb = None
+        if torch.cuda.is_available():
+            _, total_bytes = torch.cuda.mem_get_info(0)
+            total_vram_gb = total_bytes / 1024**3
+            if gpu_memory_target_gb and gpu_memory_target_gb > 0:
+                target_gpu_gb = min(gpu_memory_target_gb, total_vram_gb)
+
+        try:
+            logger.info("Selective INT8: Forcing full GPU placement (no CPU offload)")
+            load_kwargs = dict(
+                device_map="cuda:0",
+                quantization_config=quant_config,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+                moe_impl="eager",
+                moe_drop_tokens=True,
+                low_cpu_mem_usage=True,
+            )
+
+            try:
+                model = AutoModelForCausalLM.from_pretrained(model_path_str, **load_kwargs)
+            except TypeError as exc:
+                logger.warning("Falling back to legacy load args due to: %s", exc)
+                fallback_kwargs = {
+                    k: v for k, v in load_kwargs.items()
+                    if k in ["device_map", "max_memory", "quantization_config", "trust_remote_code", "torch_dtype", "low_cpu_mem_usage"]
+                }
+                model = AutoModelForCausalLM.from_pretrained(model_path_str, **fallback_kwargs)
+
+            logger.info("Loading tokenizer...")
+            model.load_tokenizer(model_path_str)
+
+            self._apply_dtype_patches()
+            patch_hunyuan_generate_image(model)
+
+            from .hunyuan_shared import install_dtype_harmonization_hooks
+            install_dtype_harmonization_hooks(model)
+
+            if hasattr(model, "vae"):
+                target_device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+                logger.info("Ensuring VAE stays in bfloat16 on %s", target_device)
+                model.vae = model.vae.to(device=target_device, dtype=torch.bfloat16)
+                for param in model.vae.parameters():
+                    if hasattr(param, "quant_state"):
+                        continue
+                    move_kwargs = {"device": target_device}
+                    if torch.is_floating_point(param):
+                        move_kwargs["dtype"] = torch.bfloat16
+                    param.data = param.data.to(**move_kwargs)
+                for buffer in model.vae.buffers():
+                    if buffer.device.type != "meta":
+                        move_kwargs = {"device": target_device}
+                        if torch.is_floating_point(buffer):
+                            move_kwargs["dtype"] = torch.bfloat16
+                        buffer.data = buffer.data.to(**move_kwargs)
+
+            logger.info("Verifying device placement...")
+            logger.info(f"  Device map: {model.hf_device_map}")
+            ensure_model_on_device(model, torch.device("cuda:0"), skip_quantized_params=True)
+
+            HunyuanModelCache.store(model_path_str, model)
+
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated(0) / 1024**3
+                reserved = torch.cuda.memory_reserved(0) / 1024**3
+                logger.info(f"✓ INT8 model loaded - VRAM Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+                logger.info("  Model distributed across GPU + CPU as needed")
+
+            logger.info("✓ INT8 model ready for generation with budget-aware nodes")
+            return (model,)
+
+        except Exception as e:
+            logger.error("Failed to load INT8 model: %s", e)
+            if model is not None:
+                try:
+                    del model
+                except Exception:
+                    pass
+            HunyuanModelCache.clear()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             raise
 
     @classmethod
@@ -1322,8 +1949,8 @@ class HunyuanImage3GenerateLarge:
             # Empirical testing shows very high VRAM usage for activations
             # 2.1MP -> ~24GB
             # 3.1MP -> ~38GB
-            # Formula adjusted to: 2GB base + 12GB per MP to be safe
-            required_free_gb = 2.0 + (megapixels * 12.0)
+            # Formula adjusted to: 2GB base + 15GB per MP to reflect actual inference demand
+            required_free_gb = 2.0 + (megapixels * 15.0)
             
             free_bytes, total_bytes = torch.cuda.mem_get_info(0)
             free_gb = free_bytes / 1024**3
@@ -1367,7 +1994,7 @@ class HunyuanImage3GenerateLarge:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     free, total = torch.cuda.mem_get_info(0)
-                    logger.info(f"GPU memory before generation: {(total-free)/1024**3:.2f}GB used, {free/1024**3:.2f}GB free")
+                    logger.info(f"GPU memory before clearing: {(total-free)/1024**3:.2f}GB used, {free/1024**3:.2f}GB free")
 
                 # Apply cpu_offload
                 # This moves the model to CPU (redundant but safe) and adds hooks to move layers to GPU during forward
@@ -1446,51 +2073,51 @@ class HunyuanImage3GenerateLarge:
 class HunyuanImage3GenerateLowVRAM(HunyuanImage3GenerateLarge):
     """
     Specialized generation node for Low VRAM (e.g. 24GB) users running Quantized models (NF4/INT8).
-    
+
     Differences from Standard/Large nodes:
     1. Optimized for models loaded with device_map="auto" (NF4/INT8)
     2. Skips conflicting 'cpu_offload' calls that break quantized models
     3. Aggressively clears cache before/after generation
     4. Supports the same resolution/prompt features as Large node
     """
-    
+
     @classmethod
     def INPUT_TYPES(cls):
         # Inherit inputs but set defaults for low VRAM
         inputs = super().INPUT_TYPES()
-        
+
         # Update defaults and tooltips for Low VRAM context
         inputs["required"]["offload_mode"] = (["smart", "always", "disabled"], {
             "default": "smart",
             "tooltip": "For NF4/INT8 models, offloading is handled automatically by the loader (device_map). This setting is ignored for quantized models."
         })
-        
+
         inputs["required"]["keep_model_loaded"] = ("BOOLEAN", {
             "default": True,
             "tooltip": "Keep model in VRAM/RAM after generation. Set to False to aggressively clear memory (slower)."
         })
-        
+
         inputs["required"]["steps"] = ("INT", {
             "default": 50, "min": 1, "max": 100,
             "tooltip": "Number of sampling steps. 30-50 is recommended."
         })
-        
+
         inputs["required"]["guidance_scale"] = ("FLOAT", {
             "default": 7.5, "min": 1.0, "max": 20.0, "step": 0.1,
             "tooltip": "Classifier-free guidance scale. Higher = closer to prompt, Lower = more creative."
         })
-        
+
         return inputs
 
     RETURN_TYPES = ("IMAGE", "STRING", "STRING", "*")
     RETURN_NAMES = ("image", "rewritten_prompt", "status", "trigger")
     FUNCTION = "generate_low_vram"
     CATEGORY = "HunyuanImage3"
-    
+
     def generate_low_vram(self, model, prompt, seed, steps, resolution, guidance_scale, offload_mode="smart", keep_model_loaded=True,
-                      enable_prompt_rewrite=False, rewrite_style="none",
-                      api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat", cpu_offload=None):
-        
+                          enable_prompt_rewrite=False, rewrite_style="none",
+                          api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat", cpu_offload=None):
+
         logger.info("=" * 60)
         logger.info("LOW VRAM GENERATION MODE (NF4/INT8 Optimized)")
         logger.info("=" * 60)
@@ -1500,37 +2127,358 @@ class HunyuanImage3GenerateLowVRAM(HunyuanImage3GenerateLarge):
         if is_accelerate_mapped:
             logger.info("✓ Detected Accelerate/Quantized model (hf_device_map present)")
             logger.info("  Skipping manual CPU offload to avoid conflicts with device_map.")
-            # For these models, we rely on the loader's device_map="auto" to handle memory.
-            # We just ensure cache is clear.
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         else:
             logger.info("! Model does not appear to be quantized/mapped. Using standard Large logic.")
-        
-        # Call the parent logic but bypass the conflicting offload block if mapped
-        # We do this by temporarily patching the offload_mode if mapped
-        
+
         original_offload_mode = offload_mode
         if is_accelerate_mapped:
-            # Force "disabled" for the parent method so it doesn't try to run accelerate_cpu_offload
-            # because that conflicts with device_map.
-            # The model is ALREADY offloaded by device_map="auto".
             offload_mode = "disabled"
             logger.info("  Internal offload_mode set to 'disabled' for parent call (handled by device_map)")
-            
+
         try:
             return super().generate_large(
-                model, prompt, seed, steps, resolution, guidance_scale, 
-                offload_mode=offload_mode, 
+                model, prompt, seed, steps, resolution, guidance_scale,
+                offload_mode=offload_mode,
                 keep_model_loaded=keep_model_loaded,
-                enable_prompt_rewrite=enable_prompt_rewrite, 
+                enable_prompt_rewrite=enable_prompt_rewrite,
                 rewrite_style=rewrite_style,
-                api_url=api_url, 
-                model_name=model_name, 
-                cpu_offload=cpu_offload
+                api_url=api_url,
+                model_name=model_name,
+                cpu_offload=cpu_offload,
             )
         finally:
-            # Aggressive cleanup after generation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                free, total = torch.cuda.mem_get_info(0)
+                logger.info(f"Post-generation cleanup: {(total-free)/1024**3:.2f}GB used")
+
+
+class HunyuanImage3GenerateTelemetry(HunyuanImage3Generate):
+    """Standard generator with RAM/VRAM telemetry output in node status."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return HunyuanImage3Generate.INPUT_TYPES()
+
+    def generate(self, model, prompt, seed, steps, resolution, guidance_scale, keep_model_loaded=True,
+                 enable_prompt_rewrite=False, rewrite_style="none",
+                 api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat",
+                 skip_device_check=False):
+        tracker = MemoryTracker()
+        image, rewritten_prompt, status, trigger = super().generate(
+            model=model,
+            prompt=prompt,
+            seed=seed,
+            steps=steps,
+            resolution=resolution,
+            guidance_scale=guidance_scale,
+            keep_model_loaded=keep_model_loaded,
+            enable_prompt_rewrite=enable_prompt_rewrite,
+            rewrite_style=rewrite_style,
+            api_url=api_url,
+            model_name=model_name,
+            skip_device_check=skip_device_check,
+        )
+
+        stats_text = format_memory_stats(tracker.finish())
+        if stats_text:
+            logger.info(f"MEMORY: {stats_text}")
+            status = f"{status} | {stats_text}"
+        return (image, rewritten_prompt, status, trigger)
+
+
+class HunyuanImage3GenerateLargeBudget(HunyuanImage3GenerateLarge):
+    """Large/offload generator with GPU budget awareness and telemetry."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = super().INPUT_TYPES()
+        optional = dict(inputs.get("optional", {}))
+        optional["gpu_budget_gb"] = ("FLOAT", {
+            "default": -1.0,
+            "min": -1.0,
+            "max": 128.0,
+            "step": 0.5,
+            "tooltip": "Override loader GPU budget for this run (GB). -1 uses loader default."
+        })
+        inputs["optional"] = optional
+        return inputs
+
+    def generate_large(self, model, prompt, seed, steps, resolution, guidance_scale, offload_mode="smart", keep_model_loaded=True,
+                       enable_prompt_rewrite=False, rewrite_style="none",
+                       api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat",
+                       cpu_offload=None, gpu_budget_gb=-1.0):
+
+        if cpu_offload is not None:
+            offload_mode = "always" if cpu_offload else "disabled"
+
+        try:
+            has_valid_device = False
+            for param in model.parameters():
+                if param.device.type == 'cuda' and param.device.index is not None:
+                    has_valid_device = True
+                    break
+                elif param.device.type == 'cpu' or param.device.index is None:
+                    break
+
+            if not has_valid_device:
+                raise RuntimeError(
+                    "Model has invalid device placement (likely cleared by Unload node). "
+                    "Please ensure the model loader runs before generation in your workflow. "
+                    "The model may have been unloaded by a previous Unload node."
+                )
+        except Exception as e:
+            if "invalid device" in str(e).lower() or "cleared by unload" in str(e).lower():
+                raise
+            logger.warning(f"Could not validate model device: {e}")
+
+        tracker = MemoryTracker()
+        tracker_starts = tracker.start_snapshot()
+        if gpu_budget_gb is not None and gpu_budget_gb > 0:
+            logger.info(f"GPU budget override set to {gpu_budget_gb:.1f}GB for this run")
+
+        generator = HunyuanImage3Generate()
+        if resolution == "Auto (model default)":
+            width, height = 1600, 1600
+            parsed_resolution = generator._default_resolution_label()
+            logger.info("Auto resolution selected: assuming 1600x1600 for safety")
+        else:
+            parsed_resolution = resolution.split(" - ")[0]
+            width, height = map(int, parsed_resolution.split("x"))
+
+        should_offload = False
+        if offload_mode == "always":
+            should_offload = True
+        elif offload_mode == "smart" and torch.cuda.is_available():
+            megapixels = (width * height) / 1_000_000
+            free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+            free_gb = free_bytes / 1024**3
+            total_gb = total_bytes / 1024**3
+
+            loader_reserve_gb = self._resolve_loader_reserve(model, total_gb, gpu_budget_gb)
+            inference_requirement = (megapixels * 15.0) + 6.0 + loader_reserve_gb
+            percent_used = (free_gb / total_gb) * 100 if total_gb else 0
+
+            if free_gb < 25.0:
+                logger.info(f"Smart Offload: Low free VRAM ({free_gb:.1f}GB < 25GB). Enabling offload.")
+                should_offload = True
+            elif percent_used > 70.0:
+                logger.info(f"Smart Offload: High VRAM usage ({percent_used:.1f}% > 70%). Enabling offload.")
+                should_offload = True
+            elif free_gb < inference_requirement:
+                logger.info(f"Smart Offload: Need {inference_requirement:.1f}GB but only {free_gb:.1f}GB free. Enabling offload.")
+                should_offload = True
+            else:
+                logger.info(f"Smart Offload: Sufficient VRAM ({free_gb:.1f}GB >= {inference_requirement:.1f}GB). Keeping on GPU.")
+
+        logger.info("=" * 60)
+        logger.info("LARGE IMAGE GENERATION MODE (Budget)")
+        logger.info(f"Resolution: {width}x{height}")
+        logger.info(f"Offload Mode: {offload_mode} -> {'Enabled' if should_offload else 'Disabled'}")
+        start_ram = tracker_starts.get("ram_start_gb")
+        start_vram = tracker_starts.get("vram_start_gb")
+        total_vram = tracker_starts.get("vram_total_gb")
+        if start_ram is not None and start_vram is not None and total_vram is not None:
+            logger.info(f"Starting Memory: RAM={start_ram:.2f}GB, VRAM={start_vram:.2f}GB / {total_vram:.2f}GB")
+        elif start_ram is not None:
+            logger.info(f"Starting Memory: RAM={start_ram:.2f}GB")
+        logger.info("=" * 60)
+
+        if should_offload:
+            try:
+                from accelerate import cpu_offload as accelerate_cpu_offload
+                logger.info("Enabling CPU offload for large image generation (budget node)...")
+
+                has_meta = False
+                for param in model.parameters():
+                    if param.device.type == 'meta':
+                        has_meta = True
+                        break
+
+                if has_meta:
+                    logger.info("Model already managed by accelerate device_map; skipping manual cpu_offload call")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        import gc
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        free, total = torch.cuda.mem_get_info(0)
+                        logger.info(f"GPU memory after clearing: {(total-free)/1024**3:.2f}GB used, {free/1024**3:.2f}GB free")
+                else:
+                    model.cpu()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        import gc
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
+                        free, total = torch.cuda.mem_get_info(0)
+                        logger.info(f"GPU memory after clearing: {(total-free)/1024**3:.2f}GB used, {free/1024**3:.2f}GB free")
+
+                    execution_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+                    offload_hook = accelerate_cpu_offload(model, execution_device=execution_device)
+                    model._cpu_offload_hook = offload_hook
+                    try:
+                        model._offload_execution_device = torch.device(execution_device)
+                    except Exception:
+                        model._offload_execution_device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+                    _force_model_device_property(model, model._offload_execution_device)
+                    logger.info("✓ CPU offload enabled via accelerate")
+
+                    if hasattr(model, '_needs_meta_patch') and model._needs_meta_patch and hasattr(model, 'prepare_model_inputs'):
+                        original_prepare = model.prepare_model_inputs
+
+                        def patched_prepare_model_inputs(self, *args, **kwargs):
+                            needs_patch = hasattr(self, 'device') and getattr(self.device, 'type', None) == 'meta'
+                            target_device = getattr(self, '_offload_execution_device', None)
+                            if target_device is None and torch.cuda.is_available():
+                                target_device = torch.device("cuda:0")
+                            if target_device is None:
+                                target_device = torch.device("cpu")
+
+                            if needs_patch:
+                                original_device = self.device
+                                self.__dict__['device'] = target_device
+                            else:
+                                original_device = None
+
+                            try:
+                                return original_prepare(*args, **kwargs)
+                            finally:
+                                if needs_patch:
+                                    if original_device is None:
+                                        self.__dict__.pop('device', None)
+                                    else:
+                                        self.__dict__['device'] = original_device
+
+                        model.prepare_model_inputs = patched_prepare_model_inputs.__get__(model, type(model))
+                        logger.info("✓ Applied meta device patch after CPU offload")
+                        model._needs_meta_patch = False
+
+            except ImportError:
+                logger.warning("accelerate library not found, cannot enable CPU offload")
+            except Exception as e:
+                logger.warning(f"Could not configure CPU offload: {e}")
+
+        original_get_target_size = None
+        if hasattr(model, "image_processor") and hasattr(model.image_processor, "reso_group"):
+            reso_group = model.image_processor.reso_group
+            original_get_target_size = reso_group.get_target_size
+
+            def new_get_target_size(w, h):
+                key = (int(round(h)), int(round(w)))
+                if key in reso_group._lookup:
+                    return reso_group._lookup[key].w, reso_group._lookup[key].h
+                return int(w), int(h)
+
+            reso_group.get_target_size = new_get_target_size
+            logger.info("Applied resolution patch to bypass bucket snapping")
+
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(0)
+
+            image_tensor, rewritten_prompt, status, trigger = generator.generate(
+                model=model,
+                prompt=prompt,
+                seed=seed,
+                steps=steps,
+                resolution=parsed_resolution,
+                guidance_scale=guidance_scale,
+                keep_model_loaded=keep_model_loaded,
+                enable_prompt_rewrite=enable_prompt_rewrite,
+                rewrite_style=rewrite_style,
+                api_url=api_url,
+                model_name=model_name,
+                skip_device_check=should_offload
+            )
+
+            if torch.cuda.is_available():
+                free, total = torch.cuda.mem_get_info(0)
+                logger.info(f"GPU memory after generation: {(total-free)/1024**3:.2f}GB used, {free/1024**3:.2f}GB free")
+
+            stats_text = format_memory_stats(tracker.finish())
+            logger.info("=" * 60)
+            logger.info("✓ Large image generated successfully (budget node)")
+            if stats_text:
+                logger.info(f"MEMORY: {stats_text}")
+            logger.info("=" * 60)
+
+            if stats_text:
+                status = f"Large image mode (Offload: {offload_mode}) - {status} | {stats_text}"
+            else:
+                status = f"Large image mode (Offload: {offload_mode}) - {status}"
+
+            return (image_tensor, rewritten_prompt, status, True)
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                logger.error("GPU Out of Memory! Try reducing resolution or enabling offload.")
+            raise
+        finally:
+            if original_get_target_size is not None:
+                model.image_processor.reso_group.get_target_size = original_get_target_size
+                logger.info("Restored original resolution logic")
+
+
+class HunyuanImage3GenerateLowVRAMBudget(HunyuanImage3GenerateLargeBudget):
+    """Low VRAM optimized generator with GPU budget override support."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = HunyuanImage3GenerateLowVRAM.INPUT_TYPES()
+        optional = dict(inputs.get("optional", {}))
+        optional["gpu_budget_gb"] = ("FLOAT", {
+            "default": -1.0,
+            "min": -1.0,
+            "max": 128.0,
+            "step": 0.5,
+            "tooltip": "Override loader GPU budget for this run (GB). -1 uses loader default."
+        })
+        inputs["optional"] = optional
+        return inputs
+
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "*")
+    RETURN_NAMES = ("image", "rewritten_prompt", "status", "trigger")
+    FUNCTION = "generate_low_vram"
+    CATEGORY = "HunyuanImage3"
+
+    def generate_low_vram(self, model, prompt, seed, steps, resolution, guidance_scale, offload_mode="smart", keep_model_loaded=True,
+                          enable_prompt_rewrite=False, rewrite_style="none",
+                          api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat",
+                          cpu_offload=None, gpu_budget_gb=-1.0):
+
+        logger.info("=" * 60)
+        logger.info("LOW VRAM GENERATION MODE (Budget)")
+        logger.info("=" * 60)
+
+        is_accelerate_mapped = hasattr(model, "hf_device_map")
+        if is_accelerate_mapped:
+            logger.info("✓ Detected Accelerate/Quantized model (hf_device_map present)")
+            logger.info("  Skipping manual CPU offload to avoid conflicts with device_map.")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            offload_mode = "disabled"
+        else:
+            logger.info("! Model does not appear to be quantized/mapped. Using standard Large logic.")
+
+        try:
+            return super().generate_large(
+                model, prompt, seed, steps, resolution, guidance_scale,
+                offload_mode=offload_mode,
+                keep_model_loaded=keep_model_loaded,
+                enable_prompt_rewrite=enable_prompt_rewrite,
+                rewrite_style=rewrite_style,
+                api_url=api_url,
+                model_name=model_name,
+                cpu_offload=cpu_offload,
+                gpu_budget_gb=gpu_budget_gb,
+            )
+        finally:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 free, total = torch.cuda.mem_get_info(0)
@@ -1540,17 +2488,27 @@ class HunyuanImage3GenerateLowVRAM(HunyuanImage3GenerateLarge):
 NODE_CLASS_MAPPINGS = {
     "HunyuanImage3QuantizedLoader": HunyuanImage3QuantizedLoader,
     "HunyuanImage3Int8Loader": HunyuanImage3Int8Loader,
+    "HunyuanImage3NF4LoaderLowVRAMBudget": HunyuanImage3NF4LoaderLowVRAMBudget,
+    "HunyuanImage3Int8LoaderBudget": HunyuanImage3Int8LoaderBudget,
     "HunyuanImage3Generate": HunyuanImage3Generate,
+    "HunyuanImage3GenerateTelemetry": HunyuanImage3GenerateTelemetry,
     "HunyuanImage3GenerateLarge": HunyuanImage3GenerateLarge,
+    "HunyuanImage3GenerateLargeBudget": HunyuanImage3GenerateLargeBudget,
     "HunyuanImage3GenerateLowVRAM": HunyuanImage3GenerateLowVRAM,
+    "HunyuanImage3GenerateLowVRAMBudget": HunyuanImage3GenerateLowVRAMBudget,
     "HunyuanImage3Unload": HunyuanImage3Unload,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "HunyuanImage3QuantizedLoader": "Hunyuan 3 Loader (NF4)",
     "HunyuanImage3Int8Loader": "Hunyuan 3 Loader (INT8)",
+    "HunyuanImage3NF4LoaderLowVRAMBudget": "Hunyuan 3 Loader (NF4 Low VRAM+)",
+    "HunyuanImage3Int8LoaderBudget": "Hunyuan 3 Loader (INT8 Budget)",
     "HunyuanImage3Generate": "Hunyuan 3 Generate",
+    "HunyuanImage3GenerateTelemetry": "Hunyuan 3 Generate (Telemetry)",
     "HunyuanImage3GenerateLarge": "Hunyuan 3 Generate (Large/Offload)",
+    "HunyuanImage3GenerateLargeBudget": "Hunyuan 3 Generate (Large Budget)",
     "HunyuanImage3GenerateLowVRAM": "Hunyuan 3 Generate (Low VRAM)",
+    "HunyuanImage3GenerateLowVRAMBudget": "Hunyuan 3 Generate (Low VRAM Budget)",
     "HunyuanImage3Unload": "Hunyuan 3 Unload",
 }

@@ -11,7 +11,12 @@
 		},
 		{
 			"path": "../../models/HunyuanImage-3-NF4"
+		},
+		{
+			"path": "../../models/HunyuanImage-3-INT8"
 		}
 	],
-	"settings": {}
+	"settings": {
+		"powershell.cwd": "Eric_Hunyuan3"
+	}
 }

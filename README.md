@@ -6,15 +6,21 @@
 
 Professional ComfyUI custom nodes for [Tencent HunyuanImage-3.0](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0), the powerful 80B parameter native multimodal image generation model.
 
+> **Latest**
+>
+> - ✅ **NF4 Low VRAM Loader + Low VRAM Budget generator are verified on 24‑32 GB cards** thanks to the custom device-map strategy that pins every quantized layer on GPU.
+> - ✅ **INT8 Budget loader works end-to-end** and a pre-quantized checkpoint is available on Hugging Face: [EricRollei/Hunyuan_Image_3_Int8](https://huggingface.co/EricRollei/Hunyuan_Image_3_Int8) for anyone who wants INT8 quality without running the quantizer locally.
+> - 📸 Added a reference workflow (below) showing the recommended node pair for Low VRAM setups.
+
 > **🙏 Acknowledgment**: This project integrates the HunyuanImage-3.0 model developed by **Tencent Hunyuan Team** and uses their official system prompts. The model and original code are licensed under [Apache 2.0](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE). This integration code is separately licensed under CC BY-NC 4.0 for non-commercial use.
 
 ## 📋 TODO / Known Issues
 
-- [ ] **INT8 Loader**: Currently non-functional due to bitsandbytes validation issues with CPU offload. Use NF4 or BF16 loaders instead.
-- [ ] Add example workflows to repository
-- [ ] Add screenshots/documentation for each node
-- [ ] Test and document multi-GPU setup
-- [ ] Optimize Low VRAM node for 24GB cards
+- [x] **NF4 Low VRAM Loader**: Custom device map keeps NF4 layers on GPU so 24‑32 GB cards can use the Low VRAM Budget workflow without bitsandbytes errors.
+- [x] Provide example workflow/screenshot for Low VRAM users (see below).
+- [ ] Add screenshots/documentation for every node (in progress).
+- [ ] Test and document multi-GPU setup.
+- [ ] Continue long-run stability testing on the INT8 Budget loader with CPU offload edge cases.
 
 ## 🎯 Features
 
@@ -88,6 +94,7 @@ This version is compressed to 8-bit, offering near-original quality with reduced
 - **Performance**: 
   - **Quality**: ~98% of full precision (better than NF4).
   - **Speed**: Faster inference than NF4 (less dequantization overhead) but requires more memory transfer if offloading.
+  - **Practical Requirement**: For the selective INT8 checkpoints shipped here, you realistically need a 96GB-class GPU (RTX 6000 Pro Blackwell, H100, etc.). Forcing CPU offload on smaller cards makes each step take minutes because the quantized tensors continually stream over PCIe.
 
 ### Quick Install
 
@@ -122,7 +129,17 @@ cd ../../models
 huggingface-cli download EricRollei/HunyuanImage-3-NF4-ComfyUI --local-dir HunyuanImage-3-NF4
 ```
 
-**Option C: Quantize Yourself (from Full Model)**
+**Option C: Download Pre-Quantized INT8 Model (~85GB)**
+If you want maximum fidelity without running the INT8 quantizer locally, grab the ready-to-go checkpoint:
+[EricRollei/Hunyuan_Image_3_Int8](https://huggingface.co/EricRollei/Hunyuan_Image_3_Int8)
+
+```bash
+# Download to ComfyUI/models/
+cd ../../models
+huggingface-cli download EricRollei/Hunyuan_Image_3_Int8 --local-dir HunyuanImage-3-INT8
+```
+
+**Option D: Quantize Yourself (from Full Model)**
 If you prefer to quantize it yourself:
 ```bash
 # First download full model (Option A), then quantize
@@ -136,19 +153,48 @@ python hunyuan_quantize_nf4.py \
 
 ## 🚀 Usage
 
+### 📸 Low VRAM Workflow Reference
+
+![Low VRAM Workflow](Docs/LowVRAM-Workflow-Image.png)
+
+Pair **Hunyuan 3 Loader (NF4 Low VRAM+)** with **Hunyuan 3 Generate (Low VRAM Budget)** for 24‑32 GB cards. The loader’s GPU budget slider keeps 18–20 GB free for inference while the generator adds smart telemetry and optional prompt rewriting. The screenshot above shows a full working chain (loader → rewriter → Low VRAM Budget generator → save/display) producing a 1600×1600 render on a 24 GB test rig without triggering bitsandbytes validation.
+
 ### Node Overview
 
 | Node Name | Purpose | VRAM Required | Speed |
 |-----------|---------|---------------|-------|
 | **Hunyuan 3 Loader (NF4)** | Load quantized model | ~45GB | Fast load |
+| **Hunyuan 3 Loader (NF4 Low VRAM+)** | NF4 loader with GPU budget slider for 24‑32GB GPUs | 18‑28GB (configurable) | Balanced |
+| **Hunyuan 3 Loader (INT8 Budget)** | INT8 loader with GPU budget & telemetry metadata | 20‑55GB (configurable) | Balanced |
 | **Hunyuan 3 Loader (Full BF16)** | Load full precision model | ~80GB | Moderate |
 | **Hunyuan 3 Loader (Full BF16 GPU)** | Single GPU with memory control | ~75GB+ | Moderate |
 | **Hunyuan 3 Loader (Multi-GPU BF16)** | Distribute across GPUs | 80GB total | Fast |
 | **Hunyuan 3 Loader (88GB GPU Optimized)** | **DEPRECATED** - Use Full BF16 Loader | - | - |
 | **Hunyuan 3 Generate** | Standard generation (<2MP) | Varies | **Fast** ⚡ |
+| **Hunyuan 3 Generate (Telemetry)** | Adds RAM/VRAM stats to status output | Varies | Fast |
 | **Hunyuan 3 Generate (Large/Offload)** | Large images (2-8MP+) | Varies | Moderate |
+| **Hunyuan 3 Generate (Large Budget)** | Large/offload with GPU budget override + telemetry | Varies | Moderate |
+| **Hunyuan 3 Generate (Low VRAM)** | Quantized-friendly large generation | Varies | Moderate |
+| **Hunyuan 3 Generate (Low VRAM Budget)** | Low VRAM mode with smart heuristics + telemetry | Varies | Moderate |
 | **Hunyuan 3 Unload** | Free VRAM | - | Instant |
 | **Hunyuan 3 GPU Info** | Diagnostic/GPU detection | - | Instant |
+
+> 🆕 **Budget/Telemetry Nodes**: New loader/generator variants keep the legacy nodes untouched while exposing GPU budget sliders, smarter "smart" mode logic, and MemoryTracker telemetry in the node status. Mix and match them only if you need the extra controls; existing workflows can stay on the classic nodes.
+
+### INT8 Budget Workflow Controls
+
+When using the **Hunyuan 3 Loader (INT8 Budget)** + **Hunyuan 3 Generate (Large Budget)** path (recommended for 96 GB RTX 6000 Pro / similar cards), keep these controls in mind:
+
+- `reserve_memory_gb` (loader): Amount of VRAM the loader leaves free for inference overhead. Set to ~20 GB for 1.5–2 MP work; increase when targeting 4K+ so Smart mode has headroom without forcing CPU offload.
+- `gpu_memory_target_gb` (loader): How much VRAM the INT8 weights are allowed to occupy. 80 GB is a good sweet spot on 96 GB GPUs. Lower values keep more VRAM free but may require CPU spillover during load.
+- `offload_mode` (Large Budget generator):
+  - `smart` (default) reads the loader’s reserve/budget metadata, estimates per-megapixel cost (~15 GB/MP + 6 GB), and only enables accelerate CPU offload when VRAM is critically low.
+  - `disabled` forces fully-on-GPU sampling (fastest) – use this for ≤2 MP jobs when you already fit in VRAM.
+  - `always` moves the model into accelerate offload before sampling. Only select this for extreme resolutions where you expect to exceed available VRAM; otherwise it slows INT8 inference to CPU speeds.
+- `keep_model_loaded` (Large Budget generator): When `False`, the node calls the same cache-clearing logic as **Hunyuan 3 Unload** after a run, freeing the INT8 weights from VRAM/RAM. Leave it `True` for iterative workflows to avoid reload times.
+- `gpu_budget_gb` override (Large Budget generator): Temporarily overrides the loader’s `_loader_gpu_budget_gb` value for Smart-mode math without remapping tensors. Set it if you want Smart mode to assume a different baseline (e.g., 65 GB) without reloading the model; leave at `-1` to use the loader’s recorded budget.
+
+These generator settings never remap the model by themselves—they only influence whether accelerate offload engages and whether we clear the cached model afterward. Adjust the loader slider first (20 GB reserve / 80 GB target recommended), then use the generator controls to decide when to keep models in memory or trigger CPU offload for very large renders.
 
 ### Node Compatibility Guide
 

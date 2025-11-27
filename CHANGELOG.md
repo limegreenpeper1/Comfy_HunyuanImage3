@@ -18,6 +18,10 @@ All notable changes to this project will be documented in this file.
 - Generation nodes now return 3 outputs: `(image, rewritten_prompt, status)` instead of just `(image,)`
 - Status messages provide better feedback about generation settings
 
+### Fixed
+- **Low VRAM NF4 Loader**: Resolved validation errors on 24GB/32GB cards by implementing a custom device map strategy that forces NF4 layers to GPU while allowing other components to offload to CPU.
+- **Device Mapping**: Added logic to prevent `bitsandbytes` from seeing 4-bit layers on CPU, which was causing crashes in Low VRAM mode.
+
 ### Technical Details
 - `rewritten_prompt`: STRING - The final prompt used for generation (either original or LLM-rewritten)
 - `status`: STRING - Human-readable status message about the generation process
@@ -30,3 +34,11 @@ All notable changes to this project will be documented in this file.
 - Official HunyuanImage-3.0 prompt enhancement with LLM APIs
 - Large image generation with CPU offload
 - Professional resolution presets with megapixel indicators
+
+## [Low VRAM Fix] - 2024-11-19
+
+### Fixed Low VRAM NF4 Loader
+- Resolved validation errors on 24GB/32GB cards by implementing a custom device map strategy that forces NF4 layers to GPU while allowing other components to offload to CPU.
+
+### Enhanced Device Mapping
+- Added logic to prevent `bitsandbytes` from seeing 4-bit layers on CPU, which was causing crashes in Low VRAM mode.
