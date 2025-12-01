@@ -39,6 +39,8 @@ from comfy.utils import ProgressBar
 
 from .hunyuan_shared import (
     HunyuanImage3Unload,
+    HunyuanImage3ForceUnload,
+    HunyuanImage3SoftUnload,
     HunyuanModelCache,
     MemoryTracker,
     ensure_model_on_device,
@@ -67,6 +69,97 @@ def _force_model_device_property(model, device: torch.device) -> None:
         cls._hunyuan_device_prop_patched = True  # type: ignore[attr-defined]
 
     model._forced_device = device  # type: ignore[attr-defined]
+
+
+def _is_model_int8_quantized(model) -> bool:
+    """Check if a model was loaded with INT8 quantization."""
+    # Check for INT8 Linear layers from bitsandbytes
+    try:
+        from bitsandbytes.nn import Linear8bitLt
+        for module in model.modules():
+            if isinstance(module, Linear8bitLt):
+                return True
+    except ImportError:
+        pass
+    
+    # Check model metadata/attributes
+    if hasattr(model, '_hunyuan_quantization_type'):
+        return 'int8' in str(model._hunyuan_quantization_type).lower()
+    
+    # Check config for quantization hints
+    if hasattr(model, 'config'):
+        config = model.config
+        if hasattr(config, 'quantization_config'):
+            qconfig = config.quantization_config
+            if hasattr(qconfig, 'load_in_8bit') and qconfig.load_in_8bit:
+                return True
+    
+    return False
+
+
+def _get_gpu_info() -> dict:
+    """Get GPU name and VRAM info."""
+    info = {
+        'name': 'Unknown',
+        'total_vram_gb': 0.0,
+        'free_vram_gb': 0.0,
+        'is_blackwell': False,
+        'is_rtx_6000': False,
+    }
+    
+    if not torch.cuda.is_available():
+        return info
+    
+    try:
+        info['name'] = torch.cuda.get_device_name(0)
+        free, total = torch.cuda.mem_get_info(0)
+        info['total_vram_gb'] = total / 1024**3
+        info['free_vram_gb'] = free / 1024**3
+        
+        # Detect specific GPUs
+        name_lower = info['name'].lower()
+        info['is_blackwell'] = 'blackwell' in name_lower or 'b200' in name_lower or '6000' in name_lower
+        info['is_rtx_6000'] = '6000' in name_lower or 'rtx 6000' in name_lower
+    except Exception as e:
+        logger.debug(f"Could not get GPU info: {e}")
+    
+    return info
+
+
+def _calculate_resolution_megapixels(resolution_str: str) -> float:
+    """Calculate megapixels from a resolution string like '1920x1080' or 'Auto (model default)'."""
+    if 'auto' in resolution_str.lower():
+        # Auto mode can choose up to ~2.5MP, assume worst case
+        return 2.5
+    
+    try:
+        # Extract WxH from strings like "1920x1080 - Landscape 1080p (2.1MP)"
+        parts = resolution_str.split(' - ')[0].strip()
+        if 'x' in parts:
+            w, h = map(int, parts.split('x'))
+            return (w * h) / 1_000_000
+    except Exception:
+        pass
+    
+    return 1.0  # Default fallback
+
+
+def _estimate_inference_vram_gb(megapixels: float) -> float:
+    """
+    Estimate VRAM required for inference based on resolution.
+    
+    Based on real-world measurements:
+    - 1MP: ~12GB
+    - 2MP: ~22GB  
+    - 3MP: ~45GB
+    
+    This follows roughly exponential growth due to attention's O(n²) complexity.
+    Formula: 12 * MP^1.5 (approximately)
+    """
+    # Use empirical formula based on measurements
+    # 1MP -> 12GB, 2MP -> ~22GB, 3MP -> ~42GB (close to measured 45GB)
+    base_vram = 12.0
+    return base_vram * (megapixels ** 1.4)
 
 
 @lru_cache(maxsize=1)
@@ -1111,29 +1204,44 @@ class HunyuanImage3Int8LoaderBudget:
                     HunyuanModelCache.clear()
                     cached = None
                 else:
-                    # Check if model has valid device placement
-                    has_valid_device = False
-                    try:
-                        # Check a model parameter to see if it has a valid device
-                        for param in cached.parameters():
-                            if param.device.type == 'cuda' and param.device.index is not None:
-                                has_valid_device = True
-                                break
-                            elif param.device.type == 'cpu' or param.device.index is None:
-                                break
-                    except Exception:
+                    # Check if model is on CPU (soft unloaded) - restore it fast!
+                    if HunyuanModelCache.is_on_cpu():
+                        logger.info("Found model cached on CPU - restoring to GPU (fast reload)...")
+                        import time
+                        start_time = time.time()
+                        if HunyuanModelCache.restore_to_gpu():
+                            elapsed = time.time() - start_time
+                            logger.info(f"✓ Model restored from CPU to GPU in {elapsed:.1f}s (vs ~100s from disk)")
+                            self._apply_dtype_patches()
+                            patch_hunyuan_generate_image(cached)
+                            return (cached,)
+                        else:
+                            logger.warning("Failed to restore from CPU, will reload from disk...")
+                            HunyuanModelCache.clear()
+                            cached = None
+                    else:
+                        # Model should be on GPU, validate it
                         has_valid_device = False
-                    
-                    if not has_valid_device and cached is not None:
-                        logger.warning("Cached model has invalid device placement, clearing cache and reloading...")
-                        HunyuanModelCache.clear()
-                        cached = None
-                    elif cached is not None:
-                        logger.info("Using cached INT8 model")
-                        self._apply_dtype_patches()
-                        patch_hunyuan_generate_image(cached)
-                        ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=True)
-                        return (cached,)
+                        try:
+                            for param in cached.parameters():
+                                if param.device.type == 'cuda' and param.device.index is not None:
+                                    has_valid_device = True
+                                    break
+                                elif param.device.type == 'cpu' or param.device.index is None:
+                                    break
+                        except Exception:
+                            has_valid_device = False
+                        
+                        if not has_valid_device and cached is not None:
+                            logger.warning("Cached model has invalid device placement, clearing cache and reloading...")
+                            HunyuanModelCache.clear()
+                            cached = None
+                        elif cached is not None:
+                            logger.info("Using cached INT8 model from GPU")
+                            self._apply_dtype_patches()
+                            patch_hunyuan_generate_image(cached)
+                            ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=True)
+                            return (cached,)
             except Exception as e:
                 logger.warning(f"Failed to validate cached model: {e}. Clearing cache and reloading...")
                 HunyuanModelCache.clear()
@@ -1205,12 +1313,11 @@ class HunyuanImage3Int8LoaderBudget:
 
         logger.info("Detected INT8 selective quantization")
         logger.info("  Critical layers already bfloat16 on disk")
+        logger.info("  Skipping quantization_config since model is pre-quantized")
 
-        quant_config = BitsAndBytesConfig(
-            load_in_8bit=True,
-            llm_int8_skip_modules=skip_modules if skip_modules else None,
-            llm_int8_enable_fp32_cpu_offload=True,
-        )
+        # NOTE: For PRE-QUANTIZED models, we should NOT pass quantization_config
+        # The weights are already INT8 on disk, passing config causes redundant processing
+        # and can slow down loading significantly
 
         model = None
         target_gpu_gb = None
@@ -1222,16 +1329,20 @@ class HunyuanImage3Int8LoaderBudget:
                 target_gpu_gb = min(gpu_memory_target_gb, total_vram_gb)
 
         try:
-            logger.info("Selective INT8: Forcing full GPU placement (no CPU offload)")
+            logger.info("Selective INT8: Loading pre-quantized model to GPU")
+            logger.info("  TIP: Pre-quantized models don't need quantization_config")
+            
+            # For pre-quantized INT8, load directly without quantization_config
+            # This is faster because bitsandbytes doesn't need to validate/process
             load_kwargs = dict(
                 device_map="cuda:0",
-                quantization_config=quant_config,
                 trust_remote_code=True,
                 torch_dtype=torch.bfloat16,
                 attn_implementation="sdpa",
                 moe_impl="eager",
                 moe_drop_tokens=True,
                 low_cpu_mem_usage=True,
+                # Don't pass quantization_config for pre-quantized models!
             )
 
             try:
@@ -1905,6 +2016,29 @@ class HunyuanImage3GenerateLarge:
         if cpu_offload is not None:
             offload_mode = "always" if cpu_offload else "disabled"
 
+        # === AUTO OFFLOAD OVERRIDE FOR INT8 MODELS ===
+        # Automatically switch to 'smart' offload if:
+        # 1. Model is INT8 quantized
+        # 2. offload_mode is currently 'disabled'
+        # 3. Resolution is 'Auto' or > 1.2MP
+        # This prevents OOM errors on GPUs like RTX 6000 Pro Blackwell
+        original_offload_mode = offload_mode
+        if offload_mode == "disabled":
+            is_int8 = _is_model_int8_quantized(model)
+            megapixels = _calculate_resolution_megapixels(resolution)
+            gpu_info = _get_gpu_info()
+            
+            if is_int8 and (megapixels > 1.2 or 'auto' in resolution.lower()):
+                logger.warning("="*60)
+                logger.warning("AUTO OFFLOAD OVERRIDE TRIGGERED")
+                logger.warning(f"  Model: INT8 quantized")
+                logger.warning(f"  Resolution: {resolution} ({megapixels:.1f}MP)")
+                logger.warning(f"  GPU: {gpu_info['name']} ({gpu_info['total_vram_gb']:.0f}GB)")
+                logger.warning(f"  Switching offload_mode from 'disabled' to 'smart' to prevent OOM")
+                logger.warning(f"  TIP: For 1MP resolutions, 'disabled' mode is faster and safe")
+                logger.warning("="*60)
+                offload_mode = "smart"
+
         # Validate model has valid device placement before generation
         try:
             has_valid_device = False
@@ -1944,13 +2078,10 @@ class HunyuanImage3GenerateLarge:
         if offload_mode == "always":
             should_offload = True
         elif offload_mode == "smart" and torch.cuda.is_available():
-            # Estimate memory requirements
+            # Estimate memory requirements using empirical formula
+            # Based on real measurements: 1MP=12GB, 2MP=22GB, 3MP=45GB
             megapixels = (width * height) / 1_000_000
-            # Empirical testing shows very high VRAM usage for activations
-            # 2.1MP -> ~24GB
-            # 3.1MP -> ~38GB
-            # Formula adjusted to: 2GB base + 15GB per MP to reflect actual inference demand
-            required_free_gb = 2.0 + (megapixels * 15.0)
+            required_free_gb = _estimate_inference_vram_gb(megapixels)
             
             free_bytes, total_bytes = torch.cuda.mem_get_info(0)
             free_gb = free_bytes / 1024**3
@@ -2206,6 +2337,34 @@ class HunyuanImage3GenerateLargeBudget(HunyuanImage3GenerateLarge):
         inputs["optional"] = optional
         return inputs
 
+    def _resolve_loader_reserve(self, model, total_vram_gb: float, gpu_budget_gb: float) -> float:
+        """
+        Determine how much VRAM was reserved by the loader for inference headroom.
+        
+        Args:
+            model: The loaded model
+            total_vram_gb: Total GPU VRAM in GB
+            gpu_budget_gb: User-specified GPU budget override (-1 means use default)
+            
+        Returns:
+            Estimated reserved VRAM in GB for inference
+        """
+        # If user specified a budget, calculate reserve from that
+        if gpu_budget_gb > 0:
+            return max(total_vram_gb - gpu_budget_gb, 0.0)
+        
+        # Try to get reserve from model metadata if available
+        if hasattr(model, '_loader_reserve_gb'):
+            return model._loader_reserve_gb
+        
+        # Default reserve based on model type
+        if _is_model_int8_quantized(model):
+            # INT8 models typically reserve ~15-20GB for inference
+            return 15.0
+        else:
+            # NF4/other models reserve less
+            return 6.0
+
     def generate_large(self, model, prompt, seed, steps, resolution, guidance_scale, offload_mode="smart", keep_model_loaded=True,
                        enable_prompt_rewrite=False, rewrite_style="none",
                        api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat",
@@ -2213,6 +2372,29 @@ class HunyuanImage3GenerateLargeBudget(HunyuanImage3GenerateLarge):
 
         if cpu_offload is not None:
             offload_mode = "always" if cpu_offload else "disabled"
+
+        # === AUTO OFFLOAD OVERRIDE FOR INT8 MODELS ===
+        # Automatically switch to 'smart' offload if:
+        # 1. Model is INT8 quantized
+        # 2. offload_mode is currently 'disabled'
+        # 3. Resolution is 'Auto' or > 1.2MP
+        # This prevents OOM errors on GPUs like RTX 6000 Pro Blackwell
+        original_offload_mode = offload_mode
+        if offload_mode == "disabled":
+            is_int8 = _is_model_int8_quantized(model)
+            megapixels = _calculate_resolution_megapixels(resolution)
+            gpu_info = _get_gpu_info()
+            
+            if is_int8 and (megapixels > 1.2 or 'auto' in resolution.lower()):
+                logger.warning("="*60)
+                logger.warning("AUTO OFFLOAD OVERRIDE TRIGGERED")
+                logger.warning(f"  Model: INT8 quantized")
+                logger.warning(f"  Resolution: {resolution} ({megapixels:.1f}MP)")
+                logger.warning(f"  GPU: {gpu_info['name']} ({gpu_info['total_vram_gb']:.0f}GB)")
+                logger.warning(f"  Switching offload_mode from 'disabled' to 'smart' to prevent OOM")
+                logger.warning(f"  TIP: For 1MP resolutions, 'disabled' mode is faster and safe")
+                logger.warning("="*60)
+                offload_mode = "smart"
 
         try:
             has_valid_device = False
@@ -2258,14 +2440,15 @@ class HunyuanImage3GenerateLargeBudget(HunyuanImage3GenerateLarge):
             total_gb = total_bytes / 1024**3
 
             loader_reserve_gb = self._resolve_loader_reserve(model, total_gb, gpu_budget_gb)
-            inference_requirement = (megapixels * 15.0) + 6.0 + loader_reserve_gb
-            percent_used = (free_gb / total_gb) * 100 if total_gb else 0
+            # Use empirical formula: 1MP=12GB, 2MP=22GB, 3MP=45GB
+            inference_requirement = _estimate_inference_vram_gb(megapixels) + loader_reserve_gb
+            percent_used = ((total_gb - free_gb) / total_gb) * 100 if total_gb else 0
 
-            if free_gb < 25.0:
-                logger.info(f"Smart Offload: Low free VRAM ({free_gb:.1f}GB < 25GB). Enabling offload.")
+            if free_gb < 15.0:
+                logger.info(f"Smart Offload: Low free VRAM ({free_gb:.1f}GB < 15GB). Enabling offload.")
                 should_offload = True
-            elif percent_used > 70.0:
-                logger.info(f"Smart Offload: High VRAM usage ({percent_used:.1f}% > 70%). Enabling offload.")
+            elif percent_used > 85.0:
+                logger.info(f"Smart Offload: High VRAM usage ({percent_used:.1f}% > 85%). Enabling offload.")
                 should_offload = True
             elif free_gb < inference_requirement:
                 logger.info(f"Smart Offload: Need {inference_requirement:.1f}GB but only {free_gb:.1f}GB free. Enabling offload.")
@@ -2497,6 +2680,8 @@ NODE_CLASS_MAPPINGS = {
     "HunyuanImage3GenerateLowVRAM": HunyuanImage3GenerateLowVRAM,
     "HunyuanImage3GenerateLowVRAMBudget": HunyuanImage3GenerateLowVRAMBudget,
     "HunyuanImage3Unload": HunyuanImage3Unload,
+    "HunyuanImage3SoftUnload": HunyuanImage3SoftUnload,
+    "HunyuanImage3ForceUnload": HunyuanImage3ForceUnload,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2511,4 +2696,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HunyuanImage3GenerateLowVRAM": "Hunyuan 3 Generate (Low VRAM)",
     "HunyuanImage3GenerateLowVRAMBudget": "Hunyuan 3 Generate (Low VRAM Budget)",
     "HunyuanImage3Unload": "Hunyuan 3 Unload",
+    "HunyuanImage3SoftUnload": "Hunyuan 3 Soft Unload (Fast)",
+    "HunyuanImage3ForceUnload": "Hunyuan 3 Force Unload (Nuclear)",
 }

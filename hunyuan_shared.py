@@ -384,19 +384,233 @@ class HunyuanModelCache:
 
     _cached_model = None
     _cached_path: Optional[str] = None
+    _model_on_cpu = False  # Track if model is parked on CPU for fast reload
 
     @classmethod
     def get(cls, model_path: str):
         if cls._cached_model is not None and cls._cached_path == model_path:
-            logger.info("Using cached Hunyuan model for %s", model_path)
+            if cls._model_on_cpu:
+                logger.info("Found cached Hunyuan model on CPU for %s - will move to GPU", model_path)
+            else:
+                logger.info("Using cached Hunyuan model for %s", model_path)
             return cls._cached_model
         return None
+
+    @classmethod
+    def is_on_cpu(cls) -> bool:
+        """Check if cached model is currently parked on CPU."""
+        return cls._model_on_cpu and cls._cached_model is not None
 
     @classmethod
     def store(cls, model_path: str, model) -> None:
         logger.info("Caching Hunyuan model for reuse: %s", model_path)
         cls._cached_model = model
         cls._cached_path = model_path
+        cls._model_on_cpu = False
+
+    @classmethod
+    def soft_unload(cls) -> bool:
+        """
+        Move model to CPU RAM but keep it cached for fast reload.
+        
+        This frees GPU VRAM while avoiding the slow disk reload.
+        CPU->GPU reload is ~10-20 seconds vs 1-2 minutes from disk.
+        
+        Returns:
+            True if model was moved to CPU, False if no model or already on CPU
+        """
+        import gc
+        
+        if cls._cached_model is None:
+            logger.info("No model cached, nothing to soft unload")
+            return False
+        
+        if cls._model_on_cpu:
+            logger.info("Model already on CPU")
+            # Still clear CUDA cache
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return False
+        
+        # Check if model is quantized (INT8/NF4) - these can't be moved with .to()
+        is_quantized = cls._is_model_quantized(cls._cached_model)
+        if is_quantized:
+            logger.warning("=" * 60)
+            logger.warning("SOFT UNLOAD NOT SUPPORTED FOR QUANTIZED MODELS")
+            logger.warning("INT8/NF4 quantized models use bitsandbytes which locks")
+            logger.warning("tensors to their device. Use full Unload instead.")
+            logger.warning("=" * 60)
+            return False
+        
+        # Check if model has meta tensors (from HF device_map offloading)
+        has_meta = cls._has_meta_tensors(cls._cached_model)
+        if has_meta:
+            logger.warning("=" * 60)
+            logger.warning("SOFT UNLOAD NOT SUPPORTED FOR OFFLOADED MODELS")
+            logger.warning("Model was loaded with device_map offloading (smart mode)")
+            logger.warning("which uses meta tensors that cannot be moved.")
+            logger.warning("To use soft unload, load with offload_mode='disabled'.")
+            logger.warning("=" * 60)
+            return False
+        
+        logger.info("Soft unloading: Moving model to CPU RAM (fast reload later)...")
+        import time
+        start_time = time.time()
+        
+        try:
+            model = cls._cached_model
+            
+            # Remove any GPU-specific hooks before moving
+            hook = getattr(model, '_cpu_offload_hook', None)
+            if hook is not None:
+                try:
+                    hook.remove()
+                except Exception:
+                    pass
+            
+            # Move all parameters and buffers to CPU
+            model.cpu()
+            
+            # Mark as on CPU
+            cls._model_on_cpu = True
+            
+            # Clear CUDA cache
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
+            elapsed = time.time() - start_time
+            
+            if torch.cuda.is_available():
+                free, total = torch.cuda.mem_get_info(0)
+                logger.info(f"✓ Model moved to CPU in {elapsed:.1f}s - VRAM now {free/1024**3:.1f}GB free")
+            else:
+                logger.info(f"✓ Model moved to CPU in {elapsed:.1f}s")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to soft unload: {e}")
+            return False
+
+    @classmethod
+    def _has_meta_tensors(cls, model) -> bool:
+        """Check if model has meta tensors (from HuggingFace device_map offloading)."""
+        if model is None:
+            return False
+        
+        try:
+            for param in model.parameters():
+                if param.device.type == 'meta':
+                    return True
+            for buffer in model.buffers():
+                if buffer.device.type == 'meta':
+                    return True
+        except Exception:
+            pass
+        
+        # Also check for hf_device_map attribute which indicates offloading was used
+        if hasattr(model, 'hf_device_map') and model.hf_device_map:
+            # If device_map has 'cpu' or 'disk' values, meta tensors are likely
+            device_map = model.hf_device_map
+            if isinstance(device_map, dict):
+                for device in device_map.values():
+                    if device in ('cpu', 'disk', 'meta'):
+                        return True
+        
+        return False
+
+    @classmethod
+    def _is_model_quantized(cls, model) -> bool:
+        """Check if model uses bitsandbytes quantization (INT8 or NF4)."""
+        if model is None:
+            return False
+        
+        try:
+            # Check for bitsandbytes quantized layers
+            from bitsandbytes.nn import Linear8bitLt, Linear4bit
+            for module in model.modules():
+                if isinstance(module, (Linear8bitLt, Linear4bit)):
+                    return True
+        except ImportError:
+            pass
+        
+        # Check for quantization config
+        if hasattr(model, 'config') and hasattr(model.config, 'quantization_config'):
+            return True
+        
+        # Check for quant_state on any parameter
+        for param in model.parameters():
+            if hasattr(param, 'quant_state'):
+                return True
+        
+        return False
+
+    @classmethod 
+    def restore_to_gpu(cls, device: torch.device = None) -> bool:
+        """
+        Move CPU-cached model back to GPU.
+        
+        This is MUCH faster than reloading from disk (~10-20s vs 1-2min).
+        NOTE: Does NOT work for INT8/NF4 quantized models (bitsandbytes limitation).
+        
+        Returns:
+            True if model was moved to GPU, False otherwise
+        """
+        if cls._cached_model is None:
+            logger.info("No model cached to restore")
+            return False
+        
+        if not cls._model_on_cpu:
+            logger.info("Model is not on CPU, no restore needed")
+            return True
+        
+        # Check if model is quantized - can't restore these
+        if cls._is_model_quantized(cls._cached_model):
+            logger.error("Cannot restore quantized model - bitsandbytes does not support .to()")
+            logger.error("Model must be reloaded from disk. Clearing cache...")
+            cls._cached_model = None
+            cls._cached_path = None
+            cls._model_on_cpu = False
+            return False
+        
+        if device is None:
+            device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        
+        if device.type != "cuda":
+            logger.warning("Cannot restore to non-CUDA device")
+            return False
+        
+        logger.info(f"Restoring model from CPU to {device}...")
+        import time
+        start_time = time.time()
+        
+        try:
+            model = cls._cached_model
+            
+            # Move back to GPU
+            model.to(device)
+            
+            cls._model_on_cpu = False
+            
+            elapsed = time.time() - start_time
+            
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated(0) / 1024**3
+                logger.info(f"✓ Model restored to GPU in {elapsed:.1f}s - VRAM: {allocated:.1f}GB")
+            else:
+                logger.info(f"✓ Model restored to GPU in {elapsed:.1f}s")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to restore model to GPU: {e}")
+            # Model may be in inconsistent state, mark for full reload
+            cls._model_on_cpu = False
+            cls._cached_model = None
+            cls._cached_path = None
+            return False
 
     @classmethod
     def clear(cls) -> bool:
@@ -412,6 +626,7 @@ class HunyuanModelCache:
                 # Clear cache variables FIRST to prevent reuse during cleanup
                 cls._cached_model = None
                 cls._cached_path = None
+                cls._model_on_cpu = False
                 
                 # Remove accelerate hooks if present
                 hook = getattr(model_to_clear, '_cpu_offload_hook', None)
@@ -426,19 +641,56 @@ class HunyuanModelCache:
                     except Exception:
                         pass
 
-                # Now clean up the model
-                if hasattr(model_to_clear, 'cpu'):
-                    model_to_clear.cpu()
+                # Try to move to CPU first (helps release CUDA memory)
+                # But catch errors for meta tensors or quantized models
+                try:
+                    if hasattr(model_to_clear, 'cpu'):
+                        model_to_clear.cpu()
+                except Exception as move_err:
+                    # Meta tensors or quantized models can't be moved
+                    # Just log and continue with deletion
+                    logger.debug("Could not move model to CPU (expected for meta/quantized): %s", move_err)
+                
+                # Aggressively clear all parameter data
+                try:
+                    for param in model_to_clear.parameters():
+                        param.data = torch.empty(0)
+                        if param.grad is not None:
+                            param.grad = None
+                except Exception:
+                    pass  # Some params may be meta or locked
+                
+                # Clear all buffers too
+                try:
+                    for buffer in model_to_clear.buffers():
+                        buffer.data = torch.empty(0)
+                except Exception:
+                    pass
+                
+                # Remove all hooks that might hold references
+                try:
+                    for module in model_to_clear.modules():
+                        module._forward_hooks.clear()
+                        module._forward_pre_hooks.clear()
+                        module._backward_hooks.clear()
+                        if hasattr(module, '_state_dict_hooks'):
+                            module._state_dict_hooks.clear()
+                except Exception:
+                    pass
+                
                 # Delete all references
                 del model_to_clear
+                
             except Exception as e:
                 logger.warning("Error during model cleanup: %s", e)
                 # Ensure cache is cleared even if cleanup fails
                 cls._cached_model = None
                 cls._cached_path = None
+                cls._model_on_cpu = False
             
-            # Force garbage collection
-            gc.collect()
+            # Force garbage collection - multiple passes
+            for _ in range(3):
+                gc.collect()
             
             # Clear CUDA cache on all GPUs
             if torch.cuda.is_available():
@@ -449,6 +701,10 @@ class HunyuanModelCache:
             
             logger.info("✓ Cleared cached model and freed VRAM")
         else:
+            # Ensure flags are reset even if no model
+            cls._model_on_cpu = False
+            cls._cached_path = None
+            
             # Still clear CUDA cache even if no model was cached
             if torch.cuda.is_available():
                 for i in range(torch.cuda.device_count()):
@@ -492,6 +748,355 @@ class HunyuanImage3Unload:
         # Return a signal that changes to force downstream nodes to re-evaluate if needed
         import time
         return (cleared, float(time.time()))
+
+
+class HunyuanImage3SoftUnload:
+    """
+    Fast VRAM release - moves model to CPU RAM instead of deleting.
+    
+    *** ONLY WORKS FOR BF16 WITH offload_mode='disabled' ***
+    
+    Does NOT work with:
+    - INT8/NF4 quantized models (bitsandbytes limitation)
+    - Models loaded with offload_mode='smart' (uses meta tensors)
+    
+    For these cases, use Force Unload instead.
+    
+    When it works, this is MUCH faster for reload than full unload:
+    - Soft unload + reload: ~20-30 seconds total
+    - Full unload + reload: ~2+ minutes (disk I/O bottleneck)
+    
+    Use this when you need VRAM for downstream tasks (upscaling, detailing)
+    but will run Hunyuan again soon. The model stays in system RAM.
+    
+    Requirements:
+    - BF16 (non-quantized) model loaded with offload_mode='disabled'
+    - Sufficient VRAM to hold entire model (~160GB for BF16 - requires 192GB+ GPU)
+    - Sufficient system RAM to hold the model on CPU (~160GB)
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "action": (["soft_unload", "restore_to_gpu", "check_status"], {
+                    "default": "soft_unload",
+                    "tooltip": "soft_unload: Move to CPU. restore_to_gpu: Move back. check_status: Just report."
+                }),
+            },
+            "optional": {
+                "trigger": ("*", {"default": None}),
+            }
+        }
+
+    RETURN_TYPES = ("BOOLEAN", "STRING", "*")
+    RETURN_NAMES = ("success", "status", "signal")
+    FUNCTION = "execute"
+    CATEGORY = "HunyuanImage3"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def execute(self, action="soft_unload", trigger=None):
+        import time
+        
+        if action == "soft_unload":
+            # Check for unsupported model types BEFORE attempting soft unload
+            is_quantized = False
+            has_meta = False
+            if HunyuanModelCache._cached_model is not None:
+                is_quantized = HunyuanModelCache._is_model_quantized(HunyuanModelCache._cached_model)
+                has_meta = HunyuanModelCache._has_meta_tensors(HunyuanModelCache._cached_model)
+            
+            success = HunyuanModelCache.soft_unload()
+            if success:
+                status = "Model moved to CPU RAM - VRAM freed for other tasks"
+            elif HunyuanModelCache.is_on_cpu():
+                status = "Model already on CPU"
+                success = True
+            elif is_quantized:
+                # Quantized model detected - give specific message
+                status = "⚠️ INT8/NF4 quantized models cannot be soft-unloaded (bitsandbytes limitation). Use Force Unload instead."
+                success = False
+            elif has_meta:
+                # Model loaded with device_map offloading
+                status = "⚠️ Model loaded with offloading (smart mode) - has meta tensors. Use offload_mode='disabled' for soft unload, or use Force Unload."
+                success = False
+            elif HunyuanModelCache._cached_model is None:
+                status = "No model cached to unload"
+            else:
+                status = "Soft unload failed - try Force Unload"
+        
+        elif action == "restore_to_gpu":
+            if HunyuanModelCache._cached_model is None:
+                status = "No model cached - use loader node"
+                success = False
+            elif not HunyuanModelCache.is_on_cpu():
+                status = "Model already on GPU"
+                success = True
+            else:
+                success = HunyuanModelCache.restore_to_gpu()
+                if success:
+                    status = "Model restored to GPU from CPU RAM"
+                else:
+                    status = "Failed to restore - model may need full reload"
+        
+        elif action == "check_status":
+            if HunyuanModelCache._cached_model is None:
+                status = "No model cached"
+            elif HunyuanModelCache.is_on_cpu():
+                status = f"Model cached on CPU: {HunyuanModelCache._cached_path}"
+            else:
+                status = f"Model cached on GPU: {HunyuanModelCache._cached_path}"
+            success = HunyuanModelCache._cached_model is not None
+        
+        else:
+            status = f"Unknown action: {action}"
+            success = False
+        
+        logger.info(f"SoftUnload [{action}]: {status}")
+        return (success, status, float(time.time()))
+
+
+class HunyuanImage3ForceUnload:
+    """
+    Aggressive VRAM clearing node - nuclear option for stubborn memory leaks.
+    
+    This node performs multiple aggressive cleanup steps:
+    1. Clears model cache (same as regular Unload)
+    2. Clears all ComfyUI model management caches
+    3. Forces Python garbage collection multiple times
+    4. Resets CUDA memory allocator
+    5. Optionally hunts and destroys ALL orphaned CUDA tensors
+    
+    The "nuke_orphaned_tensors" option is the most aggressive - it scans
+    all Python objects and destroys any CUDA tensors it finds. Use this
+    after OOM errors when memory is stuck and nothing else works.
+    
+    WARNING: This may affect other loaded models in ComfyUI!
+    Use only when regular Unload doesn't work or after OOM errors.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "clear_all_models": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Clear Hunyuan model cache"
+                }),
+                "aggressive_gc": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Run aggressive garbage collection (3 passes)"
+                }),
+                "reset_cuda_allocator": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Reset CUDA memory allocator (may help after OOM)"
+                }),
+                "clear_comfy_cache": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Clear ComfyUI's internal model cache (affects all models!)"
+                }),
+                "nuke_orphaned_tensors": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "DANGEROUS: Hunt and destroy ALL CUDA tensors in memory. Use after OOM when memory is stuck."
+                }),
+            },
+            "optional": {
+                "trigger": ("*", {"default": None}),
+            }
+        }
+
+    RETURN_TYPES = ("BOOLEAN", "STRING", "*")
+    RETURN_NAMES = ("cleared", "memory_report", "unload_signal")
+    FUNCTION = "force_unload"
+    CATEGORY = "HunyuanImage3"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def force_unload(self, clear_all_models=True, aggressive_gc=True, 
+                     reset_cuda_allocator=True, clear_comfy_cache=False,
+                     nuke_orphaned_tensors=False, trigger=None):
+        import gc
+        import time
+        
+        report_lines = ["=== FORCE UNLOAD REPORT ==="]
+        cleared = False
+        
+        # Get initial VRAM state
+        vram_before = 0
+        if torch.cuda.is_available():
+            try:
+                free, total = torch.cuda.mem_get_info(0)
+                vram_before = (total - free) / 1024**3
+                report_lines.append(f"VRAM before: {vram_before:.2f}GB used")
+            except Exception as e:
+                report_lines.append(f"Could not get initial VRAM: {e}")
+        
+        # Step 1: Clear Hunyuan model cache
+        if clear_all_models:
+            try:
+                cleared = HunyuanModelCache.clear()
+                report_lines.append(f"Hunyuan cache cleared: {cleared}")
+            except Exception as e:
+                report_lines.append(f"Failed to clear Hunyuan cache: {e}")
+        
+        # Step 2: Clear ComfyUI's internal caches (optional, more aggressive)
+        if clear_comfy_cache:
+            try:
+                import comfy.model_management as mm
+                if hasattr(mm, 'unload_all_models'):
+                    mm.unload_all_models()
+                    report_lines.append("ComfyUI unload_all_models called")
+                if hasattr(mm, 'soft_empty_cache'):
+                    mm.soft_empty_cache()
+                    report_lines.append("ComfyUI soft_empty_cache called")
+                if hasattr(mm, 'cleanup_models'):
+                    mm.cleanup_models()
+                    report_lines.append("ComfyUI cleanup_models called")
+            except ImportError:
+                report_lines.append("ComfyUI model_management not available")
+            except Exception as e:
+                report_lines.append(f"ComfyUI cache clear error: {e}")
+        
+        # Step 3: Aggressive garbage collection
+        if aggressive_gc:
+            try:
+                # Multiple GC passes to catch circular references
+                for i in range(3):
+                    unreachable = gc.collect()
+                    if i == 0:
+                        report_lines.append(f"GC pass {i+1}: {unreachable} objects collected")
+                
+                # Try to clear __del__ finalizers that might hold GPU tensors
+                gc.collect()
+                
+                report_lines.append("Aggressive GC complete (3 passes)")
+            except Exception as e:
+                report_lines.append(f"GC error: {e}")
+        
+        # Step 4: CUDA cleanup
+        if torch.cuda.is_available():
+            try:
+                # Synchronize all streams first
+                torch.cuda.synchronize()
+                
+                # Empty cache on all devices
+                for i in range(torch.cuda.device_count()):
+                    with torch.cuda.device(i):
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                
+                report_lines.append("CUDA cache cleared on all devices")
+                
+                # Reset peak memory stats for accurate tracking
+                if reset_cuda_allocator:
+                    for i in range(torch.cuda.device_count()):
+                        torch.cuda.reset_peak_memory_stats(i)
+                        torch.cuda.reset_accumulated_memory_stats(i)
+                    report_lines.append("CUDA memory stats reset")
+                    
+                    # Try to release cached memory back to CUDA driver
+                    try:
+                        # This is more aggressive - releases cached blocks
+                        torch.cuda.memory._set_allocator_settings("")
+                        torch.cuda.empty_cache()
+                        report_lines.append("CUDA allocator reset")
+                    except Exception:
+                        # Not all PyTorch versions support this
+                        pass
+                
+            except Exception as e:
+                report_lines.append(f"CUDA cleanup error: {e}")
+        
+        # Step 5: NUCLEAR OPTION - Hunt and destroy orphaned CUDA tensors
+        if nuke_orphaned_tensors and torch.cuda.is_available():
+            report_lines.append("--- NUCLEAR TENSOR HUNT ---")
+            try:
+                tensors_found = 0
+                tensors_cleared = 0
+                modules_found = 0
+                
+                # Get all objects in memory
+                all_objects = gc.get_objects()
+                report_lines.append(f"Scanning {len(all_objects)} Python objects...")
+                
+                # First pass: Find and clear nn.Module instances
+                for obj in all_objects:
+                    try:
+                        if isinstance(obj, torch.nn.Module):
+                            modules_found += 1
+                            # Clear all parameters
+                            for param in obj.parameters():
+                                if param.device.type == 'cuda':
+                                    param.data = torch.empty(0, device='cpu')
+                                    tensors_cleared += 1
+                            # Clear all buffers
+                            for buf in obj.buffers():
+                                if buf.device.type == 'cuda':
+                                    buf.data = torch.empty(0, device='cpu')
+                                    tensors_cleared += 1
+                    except Exception:
+                        pass
+                
+                # Second pass: Find raw CUDA tensors
+                for obj in all_objects:
+                    try:
+                        if isinstance(obj, torch.Tensor):
+                            if obj.device.type == 'cuda':
+                                tensors_found += 1
+                                # Replace with empty CPU tensor
+                                obj.data = torch.empty(0, device='cpu')
+                                tensors_cleared += 1
+                    except Exception:
+                        pass
+                
+                report_lines.append(f"Found {modules_found} nn.Module instances")
+                report_lines.append(f"Found {tensors_found} CUDA tensors")
+                report_lines.append(f"Cleared {tensors_cleared} tensors")
+                
+                # Force cleanup after tensor hunting
+                del all_objects
+                for _ in range(5):
+                    gc.collect()
+                
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                
+                report_lines.append("Nuclear cleanup complete")
+                
+            except Exception as e:
+                report_lines.append(f"Nuclear cleanup error: {e}")
+        
+        # Final GC pass after CUDA cleanup
+        if aggressive_gc:
+            gc.collect()
+        
+        # Get final VRAM state
+        vram_after = 0
+        if torch.cuda.is_available():
+            try:
+                free, total = torch.cuda.mem_get_info(0)
+                vram_after = (total - free) / 1024**3
+                vram_freed = vram_before - vram_after
+                report_lines.append(f"VRAM after: {vram_after:.2f}GB used")
+                report_lines.append(f"VRAM freed: {vram_freed:.2f}GB")
+            except Exception as e:
+                report_lines.append(f"Could not get final VRAM: {e}")
+        
+        report_lines.append("=== END FORCE UNLOAD ===")
+        
+        # Log the report
+        for line in report_lines:
+            logger.info(line)
+        
+        memory_report = "\n".join(report_lines)
+        return (cleared or clear_comfy_cache, memory_report, float(time.time()))
 
 
 class MemoryTracker:
