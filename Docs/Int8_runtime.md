@@ -1,4 +1,4 @@
-Caching Hunyuan model for reuse: A:\Comfy25\ComfyUI_windows_portable\ComfyUI\models\HunyuanImage-3-INT8
+ Caching Hunyuan model for reuse: A:\Comfy25\ComfyUI_windows_portable\ComfyUI\models\HunyuanImage-3-INT8
 ✓ INT8 model loaded - VRAM Allocated: 80.81GB, Reserved: 81.09GB
   Model distributed across GPU + CPU as needed
 ✓ INT8 model ready for generation with budget-aware nodes

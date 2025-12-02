@@ -1283,15 +1283,25 @@ class HunyuanImage3ClearDownstream:
                 }),
             },
             "optional": {
-                "trigger": ("*", {
-                    "forceInput": True,
-                    "tooltip": "Connect ANY output (image, model, etc) to ensure this runs after that node completes"
+                # Accept common output types - IMAGE is most common at end of workflow
+                "trigger_image": ("IMAGE", {
+                    "tooltip": "Connect an IMAGE output to trigger after that node completes"
                 }),
+                "trigger_string": ("STRING", {
+                    "forceInput": True,
+                    "tooltip": "Connect a STRING output (like filepath) to trigger after that node"
+                }),
+                "trigger_latent": ("LATENT", {
+                    "tooltip": "Connect a LATENT output to trigger after that node completes"
+                }),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
             }
         }
 
-    RETURN_TYPES = ("STRING", "*")
-    RETURN_NAMES = ("memory_report", "signal")
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("memory_report",)
     FUNCTION = "clear_downstream"
     CATEGORY = "HunyuanImage3"
     OUTPUT_NODE = True
@@ -1300,7 +1310,9 @@ class HunyuanImage3ClearDownstream:
     def IS_CHANGED(cls, **kwargs):
         return float("nan")
 
-    def clear_downstream(self, clear_comfy_models=True, aggressive_gc=True, trigger=None):
+    def clear_downstream(self, clear_comfy_models=True, aggressive_gc=True, 
+                         trigger_image=None, trigger_string=None, trigger_latent=None,
+                         unique_id=None):
         import gc
         import time
         
@@ -1390,7 +1402,7 @@ class HunyuanImage3ClearDownstream:
             logger.info(line)
         
         memory_report = "\n".join(report_lines)
-        return (memory_report, float(time.time()))
+        return (memory_report,)
 
 
 class MemoryTracker:
