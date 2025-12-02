@@ -997,14 +997,26 @@ class HunyuanImage3ForceUnload:
     all Python objects and destroys any CUDA tensors it finds. Use this
     after OOM errors when memory is stuck and nothing else works.
     
+    NEW: "first_run_only" option - when enabled, the node will perform
+    the nuclear clear on the first run, then automatically skip itself
+    on subsequent runs (preserving the loaded Hunyuan model).
+    Use "Reset First Run Flag" button to re-enable for next queue.
+    
     WARNING: This may affect other loaded models in ComfyUI!
     Use only when regular Unload doesn't work or after OOM errors.
     """
+    
+    # Class variable to track first-run state per node instance
+    _first_run_completed = {}  # node_id -> bool
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "first_run_only": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Only run on FIRST execution, then auto-skip. Perfect for cleaning up cross-tab pollution while keeping Hunyuan loaded for successive runs."
+                }),
                 "clear_all_models": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Clear Hunyuan model cache"
@@ -1018,20 +1030,23 @@ class HunyuanImage3ForceUnload:
                     "tooltip": "Reset CUDA memory allocator (may help after OOM)"
                 }),
                 "clear_comfy_cache": ("BOOLEAN", {
-                    "default": False,
+                    "default": True,
                     "tooltip": "Clear ComfyUI's internal model cache (affects all models!)"
                 }),
                 "nuke_orphaned_tensors": ("BOOLEAN", {
-                    "default": False,
+                    "default": True,
                     "tooltip": "DANGEROUS: Hunt and destroy ALL CUDA tensors in memory. Use after OOM when VRAM is stuck."
                 }),
                 "nuke_ram_tensors": ("BOOLEAN", {
-                    "default": False,
+                    "default": True,
                     "tooltip": "DANGEROUS: Also hunt and destroy orphaned CPU tensors in RAM. Use when system RAM is full of leaked model weights."
                 }),
             },
             "optional": {
                 "trigger": ("*", {"default": None}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
             }
         }
 
@@ -1040,18 +1055,47 @@ class HunyuanImage3ForceUnload:
     FUNCTION = "force_unload"
     CATEGORY = "HunyuanImage3"
     OUTPUT_NODE = True
+    
+    @classmethod
+    def reset_first_run_flags(cls):
+        """Reset all first-run flags - call this to re-enable first_run_only nodes."""
+        cls._first_run_completed.clear()
+        logger.info("Force Unload: All first-run flags reset")
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
         return float("nan")
 
-    def force_unload(self, clear_all_models=True, aggressive_gc=True, 
-                     reset_cuda_allocator=True, clear_comfy_cache=False,
-                     nuke_orphaned_tensors=False, nuke_ram_tensors=False, trigger=None):
+    def force_unload(self, first_run_only=False, clear_all_models=True, aggressive_gc=True, 
+                     reset_cuda_allocator=True, clear_comfy_cache=True,
+                     nuke_orphaned_tensors=True, nuke_ram_tensors=True, 
+                     trigger=None, unique_id=None):
         import gc
         import time
         
+        # Check first_run_only logic
+        node_id = str(unique_id) if unique_id else "default"
+        
+        if first_run_only:
+            if node_id in HunyuanImage3ForceUnload._first_run_completed:
+                # Already ran once - SKIP this execution
+                skip_report = [
+                    "=== FORCE UNLOAD SKIPPED (first_run_only) ===",
+                    f"Node {node_id} already executed once this session.",
+                    "Nuclear clear was done on first run, now preserving loaded models.",
+                    "To re-enable: Restart ComfyUI or reload the workflow.",
+                    "=== END SKIP ==="
+                ]
+                logger.info("Force Unload: Skipping (first_run_only mode, already executed)")
+                return (False, "\n".join(skip_report), trigger)
+            else:
+                # First run - mark as completed and proceed
+                HunyuanImage3ForceUnload._first_run_completed[node_id] = True
+                logger.info(f"Force Unload: First run for node {node_id}, will skip on subsequent runs")
+        
         report_lines = ["=== FORCE UNLOAD REPORT ==="]
+        if first_run_only:
+            report_lines.append("Mode: first_run_only (will skip on subsequent runs)")
         cleared = False
         
         # Get initial VRAM state
