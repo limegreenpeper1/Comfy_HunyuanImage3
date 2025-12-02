@@ -177,7 +177,7 @@ Pair **Hunyuan 3 Loader (NF4 Low VRAM+)** with **Hunyuan 3 Generate (Low VRAM Bu
 | **Hunyuan 3 Generate (Low VRAM)** | Quantized-friendly large generation | Varies | Moderate |
 | **Hunyuan 3 Generate (Low VRAM Budget)** | Low VRAM mode with smart heuristics + telemetry | Varies | Moderate |
 | **Hunyuan 3 Unload** | Free VRAM | - | Instant |
-| **Hunyuan 3 Soft Unload (Fast)** | Move model to CPU (fast reload) | - | Instant |
+| **Hunyuan 3 Soft Unload (Fast)** | ⚠️ Future use - see limitations below | - | - |
 | **Hunyuan 3 Force Unload (Nuclear)** | Aggressive VRAM clearing | - | Instant |
 | **Hunyuan 3 Clear Downstream Models** | Clear other models, keep Hunyuan | - | Instant |
 | **Hunyuan 3 GPU Info** | Diagnostic/GPU detection | - | Instant |
@@ -238,7 +238,28 @@ When running workflows in multiple browser tabs, models from other tabs stay in 
 | **Unload** | Clear Hunyuan model between runs |
 | **Clear Downstream Models** | Keep Hunyuan, clear Flux/SAM2/etc. |
 | **Force Unload (Nuclear)** | After OOM errors, stuck VRAM |
-| **Soft Unload** | BF16 only - park model in RAM for fast reload |
+| **Soft Unload** | ⚠️ See limitations below |
+
+#### ⚠️ Soft Unload Node - Future/Limited Use
+
+The **Soft Unload** node is currently included for **future compatibility** but has significant limitations with current hardware and libraries:
+
+**Does NOT work with (most common cases):**
+- **INT8/NF4 quantized models** - bitsandbytes locks tensors to their device
+- **BF16 with device_map="auto"** - creates meta tensors that can't be moved
+
+**Only works with:**
+- BF16 model loaded entirely on a single GPU with NO offloading
+- This requires **~160GB+ VRAM** (no consumer/prosumer GPU exists yet)
+
+**Why it exists:**
+- Future GPUs may have 160GB+ VRAM
+- Future versions of bitsandbytes/accelerate may support moving quantized models to CPU
+- The infrastructure is ready when these limitations are resolved
+
+**For current use cases, use instead:**
+- **"Clear Downstream Models"** - clears Flux/SAM2/etc while keeping Hunyuan cached
+- **"Force Unload"** - completely removes model when needed
 
 #### BF16 Loader Target Resolution Options
 

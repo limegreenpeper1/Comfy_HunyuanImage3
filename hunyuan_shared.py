@@ -871,27 +871,30 @@ class HunyuanImage3Unload:
 
 class HunyuanImage3SoftUnload:
     """
-    Fast VRAM release - moves model to CPU RAM instead of deleting.
+    [FUTURE/LIMITED USE] Fast VRAM release - moves model to CPU RAM instead of deleting.
     
-    *** ONLY WORKS FOR BF16 WITH offload_mode='disabled' ***
+    ⚠️ CURRENT LIMITATIONS - This node has very limited practical use today:
     
-    Does NOT work with:
-    - INT8/NF4 quantized models (bitsandbytes limitation)
-    - Models loaded with offload_mode='smart' (uses meta tensors)
+    Does NOT work with (most common cases):
+    - INT8/NF4 quantized models (bitsandbytes locks tensors to device)
+    - BF16 with device_map="auto" (has meta tensors that can't move)
     
-    For these cases, use Force Unload instead.
+    Only works with:
+    - BF16 model loaded entirely on GPU with NO offloading
+    - This requires ~160GB+ VRAM (no consumer GPU exists yet)
     
-    When it works, this is MUCH faster for reload than full unload:
+    WHY KEEP THIS NODE?
+    - Future hardware may have 160GB+ VRAM
+    - Future bitsandbytes/accelerate versions may support .to(cpu)
+    - Provides infrastructure for when these limitations are resolved
+    
+    FOR CURRENT USE CASES, USE INSTEAD:
+    - "Clear Downstream Models" - clears other models, keeps Hunyuan cached
+    - "Force Unload" - completely removes model when needed
+    
+    When it works (future), benefits are:
     - Soft unload + reload: ~20-30 seconds total
     - Full unload + reload: ~2+ minutes (disk I/O bottleneck)
-    
-    Use this when you need VRAM for downstream tasks (upscaling, detailing)
-    but will run Hunyuan again soon. The model stays in system RAM.
-    
-    Requirements:
-    - BF16 (non-quantized) model loaded with offload_mode='disabled'
-    - Sufficient VRAM to hold entire model (~160GB for BF16 - requires 192GB+ GPU)
-    - Sufficient system RAM to hold the model on CPU (~160GB)
     """
 
     @classmethod
