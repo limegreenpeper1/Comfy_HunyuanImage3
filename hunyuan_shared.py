@@ -1281,8 +1281,8 @@ class HunyuanImage3ClearDownstream:
             },
             "optional": {
                 "trigger": ("*", {
-                    "default": None,
-                    "tooltip": "Connect to final output to ensure this runs after downstream models"
+                    "forceInput": True,
+                    "tooltip": "Connect ANY output (image, model, etc) to ensure this runs after that node completes"
                 }),
             }
         }
