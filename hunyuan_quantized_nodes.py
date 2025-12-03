@@ -54,6 +54,9 @@ from .hunyuan_api_config import get_api_config
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Track deprecation warnings to avoid spamming console
+_deprecation_warnings_shown = set()
+
 
 def _force_model_device_property(model, device: torch.device) -> None:
     """Ensure model.device returns a usable accelerator even when accelerate parks params on meta."""
@@ -275,7 +278,10 @@ class HunyuanImage3QuantizedLoader:
                 with meta_path.open('r') as meta_file:
                     meta = json.load(meta_file)
                 if meta.get("quantization_method") == "bitsandbytes_int8_full":
-                    logger.info("Skipping deprecated INT8-Full checkpoint: %s", item.name)
+                    # Only warn once per deprecated checkpoint
+                    if item.name not in _deprecation_warnings_shown:
+                        _deprecation_warnings_shown.add(item.name)
+                        logger.info("Skipping deprecated INT8-Full checkpoint: %s", item.name)
                     continue
             except Exception:
                 pass
