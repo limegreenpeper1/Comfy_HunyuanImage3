@@ -54,9 +54,6 @@ from .hunyuan_api_config import get_api_config
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Track deprecation warnings to avoid spamming console
-_deprecation_warnings_shown = set()
-
 
 def _force_model_device_property(model, device: torch.device) -> None:
     """Ensure model.device returns a usable accelerator even when accelerate parks params on meta."""
@@ -274,17 +271,6 @@ class HunyuanImage3QuantizedLoader:
             meta_path = item / "quantization_metadata.json"
             if not meta_path.exists():
                 continue
-            try:
-                with meta_path.open('r') as meta_file:
-                    meta = json.load(meta_file)
-                if meta.get("quantization_method") == "bitsandbytes_int8_full":
-                    # Only warn once per deprecated checkpoint
-                    if item.name not in _deprecation_warnings_shown:
-                        _deprecation_warnings_shown.add(item.name)
-                        logger.info("Skipping deprecated INT8-Full checkpoint: %s", item.name)
-                    continue
-            except Exception:
-                pass
             available.append(item.name)
         
         # Sort to prioritize NF4 models for this loader
@@ -1294,12 +1280,10 @@ class HunyuanImage3Int8LoaderBudget:
         logger.info(f"Loading {model_name} (INT8 Budget)")
 
         meta_path = Path(folder_paths.models_dir) / model_name / "quantization_metadata.json"
-        is_full_quantization = False
         if meta_path.exists():
             try:
                 with open(meta_path, 'r') as f:
                     meta = json.load(f)
-                is_full_quantization = meta.get("quantization_method") == "bitsandbytes_int8_full"
                 if meta.get("quantization_method") == "bitsandbytes_nf4":
                     logger.warning(f"⚠️ Model '{model_name}' appears to be NF4 quantized, not INT8")
             except Exception:
@@ -1334,12 +1318,6 @@ class HunyuanImage3Int8LoaderBudget:
             "self_attn",
             "cross_attn",
         ]
-
-        if is_full_quantization:
-            raise RuntimeError(
-                "INT8-Full checkpoints are deprecated. Please re-quantize with hunyuan_quantize_int8.py "
-                "to produce selective INT8 weights before using the budget loader."
-            )
 
         logger.info("Detected INT8 selective quantization")
         logger.info("  Critical layers already bfloat16 on disk")

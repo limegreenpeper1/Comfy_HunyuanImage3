@@ -2,6 +2,10 @@
 
 ## Session Date: November 25, 2025
 
+> **Note (Dec 2025)**: INT8-Full quantization was removed from the codebase as it never
+> worked reliably. Only INT8-Selective (now just called "INT8") is supported. This document
+> is preserved for historical reference of the development process.
+
 ---
 
 ## Key Learnings
