@@ -23,6 +23,7 @@ Note: HunyuanImage-3.0 model is subject to Tencent's Apache 2.0 license.
 """
 
 import logging
+import os
 from typing import Optional
 
 import psutil
@@ -389,7 +390,6 @@ class HunyuanModelCache:
     @classmethod
     def _normalize_path(cls, path: str) -> str:
         """Normalize path for consistent comparison."""
-        import os
         # Resolve to absolute, normalize slashes, remove trailing slashes
         try:
             return os.path.normpath(os.path.abspath(path)).lower()
