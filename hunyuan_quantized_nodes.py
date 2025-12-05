@@ -1481,7 +1481,10 @@ class HunyuanImage3Generate:
                 "steps": ("INT", {"default": 25, "min": 1, "max": 100}),
                 "resolution": (cls._resolution_choices(),),
                 "guidance_scale": ("FLOAT", {"default": 6.0, "min": 1.0, "max": 20.0, "step": 0.1}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+                "post_action": (["keep_loaded", "soft_unload_to_cpu", "full_unload"], {
+                    "default": "keep_loaded",
+                    "tooltip": "After generation: keep_loaded (fastest reruns), soft_unload_to_cpu (free VRAM, ~10s restore), full_unload (free VRAM+RAM, ~35s reload)"
+                }),
             },
             "optional": {
                 "enable_prompt_rewrite": ("BOOLEAN", {"default": False}),
@@ -1497,9 +1500,14 @@ class HunyuanImage3Generate:
     FUNCTION = "generate"
     CATEGORY = "HunyuanImage3"
     
-    def generate(self, model, prompt, seed, steps, resolution, guidance_scale, keep_model_loaded=True,
+    def generate(self, model, prompt, seed, steps, resolution, guidance_scale, post_action="keep_loaded",
                  enable_prompt_rewrite=False, rewrite_style="none", 
-                 api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat", skip_device_check=False):
+                 api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat", 
+                 skip_device_check=False, keep_model_loaded=None):
+        # Backward compatibility: if old keep_model_loaded param is passed, convert to post_action
+        if keep_model_loaded is not None:
+            post_action = "keep_loaded" if keep_model_loaded else "full_unload"
+        
         # Validate model has valid device placement before generation
         if not skip_device_check:
             try:
@@ -1663,8 +1671,20 @@ class HunyuanImage3Generate:
         image_np = np.array(image).astype(np.float32) / 255.0
         image_tensor = torch.from_numpy(image_np).unsqueeze(0)
         
-        if not keep_model_loaded:
+        # Handle post-generation action
+        if post_action == "soft_unload_to_cpu":
+            logger.info("Post-action: Soft unloading model to CPU RAM...")
+            success = HunyuanModelCache.soft_unload()
+            if success:
+                logger.info("✓ Model moved to CPU RAM - VRAM freed for downstream tasks")
+            else:
+                logger.warning("Soft unload failed or model already on CPU")
+        elif post_action == "full_unload":
+            logger.info("Post-action: Full unload - clearing model from memory...")
             HunyuanModelCache.clear()
+            logger.info("✓ Model cleared from memory")
+        else:
+            logger.info("Post-action: Keeping model loaded on GPU")
 
         logger.info(f"✓ Image generated successfully - tensor shape: {image_tensor.shape}")
         return (image_tensor, rewritten_prompt, status_message, True)
@@ -1985,7 +2005,10 @@ class HunyuanImage3GenerateLarge:
                 "resolution": (cls._get_large_resolutions(),),
                 "guidance_scale": ("FLOAT", {"default": 7.5, "min": 1.0, "max": 20.0, "step": 0.1}),
                 "offload_mode": (["smart", "always", "disabled"], {"default": "smart"}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+                "post_action": (["keep_loaded", "soft_unload_to_cpu", "full_unload"], {
+                    "default": "keep_loaded",
+                    "tooltip": "After generation: keep_loaded (fastest reruns), soft_unload_to_cpu (free VRAM, ~10s restore), full_unload (free VRAM+RAM, ~35s reload)"
+                }),
             },
             "optional": {
                 "enable_prompt_rewrite": ("BOOLEAN", {"default": False}),
@@ -2046,9 +2069,15 @@ class HunyuanImage3GenerateLarge:
             
         return options
     
-    def generate_large(self, model, prompt, seed, steps, resolution, guidance_scale, offload_mode="smart", keep_model_loaded=True,
+    def generate_large(self, model, prompt, seed, steps, resolution, guidance_scale, offload_mode="smart", 
+                      post_action="keep_loaded",
                       enable_prompt_rewrite=False, rewrite_style="none",
-                      api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat", cpu_offload=None):
+                      api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat", 
+                      cpu_offload=None, keep_model_loaded=None):
+        
+        # Backward compatibility for old keep_model_loaded param
+        if keep_model_loaded is not None:
+            post_action = "keep_loaded" if keep_model_loaded else "full_unload"
         
         # Backward compatibility for cpu_offload boolean
         if cpu_offload is not None:
@@ -2205,7 +2234,7 @@ class HunyuanImage3GenerateLarge:
                 steps=steps,
                 resolution=parsed_resolution,
                 guidance_scale=guidance_scale,
-                keep_model_loaded=keep_model_loaded,
+                post_action=post_action,
                 enable_prompt_rewrite=enable_prompt_rewrite,
                 rewrite_style=rewrite_style,
                 api_url=api_url,
@@ -2263,9 +2292,10 @@ class HunyuanImage3GenerateLowVRAM(HunyuanImage3GenerateLarge):
             "tooltip": "For NF4/INT8 models, offloading is handled automatically by the loader (device_map). This setting is ignored for quantized models."
         })
 
-        inputs["required"]["keep_model_loaded"] = ("BOOLEAN", {
-            "default": True,
-            "tooltip": "Keep model in VRAM/RAM after generation. Set to False to aggressively clear memory (slower)."
+        # Low VRAM users should default to soft_unload to free VRAM for downstream
+        inputs["required"]["post_action"] = (["keep_loaded", "soft_unload_to_cpu", "full_unload"], {
+            "default": "soft_unload_to_cpu",
+            "tooltip": "After generation: soft_unload_to_cpu recommended for Low VRAM to free GPU for downstream tasks"
         })
 
         inputs["required"]["steps"] = ("INT", {
@@ -2285,9 +2315,15 @@ class HunyuanImage3GenerateLowVRAM(HunyuanImage3GenerateLarge):
     FUNCTION = "generate_low_vram"
     CATEGORY = "HunyuanImage3"
 
-    def generate_low_vram(self, model, prompt, seed, steps, resolution, guidance_scale, offload_mode="smart", keep_model_loaded=True,
+    def generate_low_vram(self, model, prompt, seed, steps, resolution, guidance_scale, offload_mode="smart", 
+                          post_action="soft_unload_to_cpu",
                           enable_prompt_rewrite=False, rewrite_style="none",
-                          api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat", cpu_offload=None):
+                          api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat", 
+                          cpu_offload=None, keep_model_loaded=None):
+        
+        # Backward compatibility
+        if keep_model_loaded is not None:
+            post_action = "keep_loaded" if keep_model_loaded else "full_unload"
 
         logger.info("=" * 60)
         logger.info("LOW VRAM GENERATION MODE (NF4/INT8 Optimized)")
@@ -2312,7 +2348,7 @@ class HunyuanImage3GenerateLowVRAM(HunyuanImage3GenerateLarge):
             return super().generate_large(
                 model, prompt, seed, steps, resolution, guidance_scale,
                 offload_mode=offload_mode,
-                keep_model_loaded=keep_model_loaded,
+                post_action=post_action,
                 enable_prompt_rewrite=enable_prompt_rewrite,
                 rewrite_style=rewrite_style,
                 api_url=api_url,
@@ -2333,10 +2369,14 @@ class HunyuanImage3GenerateTelemetry(HunyuanImage3Generate):
     def INPUT_TYPES(cls):
         return HunyuanImage3Generate.INPUT_TYPES()
 
-    def generate(self, model, prompt, seed, steps, resolution, guidance_scale, keep_model_loaded=True,
+    def generate(self, model, prompt, seed, steps, resolution, guidance_scale, post_action="keep_loaded",
                  enable_prompt_rewrite=False, rewrite_style="none",
                  api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat",
-                 skip_device_check=False):
+                 skip_device_check=False, keep_model_loaded=None):
+        # Backward compatibility
+        if keep_model_loaded is not None:
+            post_action = "keep_loaded" if keep_model_loaded else "full_unload"
+            
         tracker = MemoryTracker()
         image, rewritten_prompt, status, trigger = super().generate(
             model=model,
@@ -2345,7 +2385,7 @@ class HunyuanImage3GenerateTelemetry(HunyuanImage3Generate):
             steps=steps,
             resolution=resolution,
             guidance_scale=guidance_scale,
-            keep_model_loaded=keep_model_loaded,
+            post_action=post_action,
             enable_prompt_rewrite=enable_prompt_rewrite,
             rewrite_style=rewrite_style,
             api_url=api_url,
@@ -2405,10 +2445,15 @@ class HunyuanImage3GenerateLargeBudget(HunyuanImage3GenerateLarge):
             # NF4/other models reserve less
             return 6.0
 
-    def generate_large(self, model, prompt, seed, steps, resolution, guidance_scale, offload_mode="smart", keep_model_loaded=True,
+    def generate_large(self, model, prompt, seed, steps, resolution, guidance_scale, offload_mode="smart", 
+                       post_action="keep_loaded",
                        enable_prompt_rewrite=False, rewrite_style="none",
                        api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat",
-                       cpu_offload=None, gpu_budget_gb=-1.0):
+                       cpu_offload=None, gpu_budget_gb=-1.0, keep_model_loaded=None):
+        
+        # Backward compatibility
+        if keep_model_loaded is not None:
+            post_action = "keep_loaded" if keep_model_loaded else "full_unload"
 
         if cpu_offload is not None:
             offload_mode = "always" if cpu_offload else "disabled"
@@ -2614,7 +2659,7 @@ class HunyuanImage3GenerateLargeBudget(HunyuanImage3GenerateLarge):
                 steps=steps,
                 resolution=parsed_resolution,
                 guidance_scale=guidance_scale,
-                keep_model_loaded=keep_model_loaded,
+                post_action=post_action,
                 enable_prompt_rewrite=enable_prompt_rewrite,
                 rewrite_style=rewrite_style,
                 api_url=api_url,
@@ -2672,10 +2717,15 @@ class HunyuanImage3GenerateLowVRAMBudget(HunyuanImage3GenerateLargeBudget):
     FUNCTION = "generate_low_vram"
     CATEGORY = "HunyuanImage3"
 
-    def generate_low_vram(self, model, prompt, seed, steps, resolution, guidance_scale, offload_mode="smart", keep_model_loaded=True,
+    def generate_low_vram(self, model, prompt, seed, steps, resolution, guidance_scale, offload_mode="smart", 
+                          post_action="soft_unload_to_cpu",
                           enable_prompt_rewrite=False, rewrite_style="none",
                           api_url="https://api.deepseek.com/v1/chat/completions", model_name="deepseek-chat",
-                          cpu_offload=None, gpu_budget_gb=-1.0):
+                          cpu_offload=None, gpu_budget_gb=-1.0, keep_model_loaded=None):
+        
+        # Backward compatibility
+        if keep_model_loaded is not None:
+            post_action = "keep_loaded" if keep_model_loaded else "full_unload"
 
         logger.info("=" * 60)
         logger.info("LOW VRAM GENERATION MODE (Budget)")
@@ -2695,7 +2745,7 @@ class HunyuanImage3GenerateLowVRAMBudget(HunyuanImage3GenerateLargeBudget):
             return super().generate_large(
                 model, prompt, seed, steps, resolution, guidance_scale,
                 offload_mode=offload_mode,
-                keep_model_loaded=keep_model_loaded,
+                post_action=post_action,
                 enable_prompt_rewrite=enable_prompt_rewrite,
                 rewrite_style=rewrite_style,
                 api_url=api_url,

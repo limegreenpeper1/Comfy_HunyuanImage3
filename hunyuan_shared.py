@@ -896,7 +896,11 @@ class HunyuanImage3SoftUnload:
     """
     Fast VRAM release - moves model to CPU RAM instead of deleting.
     
-    ✅ NOW WORKS WITH: (requires bitsandbytes >= 0.48.2)
+    NOTE: With the new `post_action` dropdown in Generate nodes, you may not
+    need this node at all. The Generate nodes can now soft_unload automatically
+    after generation. This standalone node is kept for advanced workflows.
+    
+    ✅ WORKS WITH: (requires bitsandbytes >= 0.48.2)
     - INT8 quantized models
     - NF4 quantized models  
     - BF16 models loaded entirely on GPU
@@ -909,23 +913,19 @@ class HunyuanImage3SoftUnload:
     - Soft unload + restore: ~10-30 seconds (scales with model size)
     - Full unload + reload from disk: ~2+ minutes
     
-    USE CASE:
-    Run Hunyuan → Soft Unload → Run downstream models (Flux, SAM2, etc.)
-    → Restore Hunyuan → Generate again (no disk reload needed!)
-    
     ACTIONS:
     - soft_unload: Move model from GPU to CPU RAM, free VRAM
-    - restore_to_gpu: Move model back to GPU for inference
     - check_status: Report current model location
+    - restore_to_gpu: (Deprecated) Loader now handles this automatically
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "action": (["soft_unload", "restore_to_gpu", "check_status"], {
+                "action": (["soft_unload", "check_status", "restore_to_gpu"], {
                     "default": "soft_unload",
-                    "tooltip": "soft_unload: Move to CPU. restore_to_gpu: Move back. check_status: Just report."
+                    "tooltip": "soft_unload: Move to CPU and free VRAM. check_status: Report location. restore_to_gpu: (deprecated, loader handles this)"
                 }),
             },
             "optional": {
@@ -982,8 +982,10 @@ class HunyuanImage3SoftUnload:
                 status = "Soft unload failed - try Force Unload"
         
         elif action == "restore_to_gpu":
+            # Deprecated: Loader now handles this automatically
+            logger.warning("restore_to_gpu is deprecated - the Loader node now automatically restores CPU-cached models")
             if HunyuanModelCache._cached_model is None:
-                status = "No model cached - use loader node"
+                status = "No model cached - use loader node (it will restore automatically)"
                 success = False
             elif not HunyuanModelCache.is_on_cpu():
                 status = "Model already on GPU"
@@ -991,7 +993,7 @@ class HunyuanImage3SoftUnload:
             else:
                 success = HunyuanModelCache.restore_to_gpu()
                 if success:
-                    status = "Model restored to GPU from CPU RAM"
+                    status = "Model restored to GPU (note: loader does this automatically now)"
                 else:
                     status = "Failed to restore - model may need full reload"
         
