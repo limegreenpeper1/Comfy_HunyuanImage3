@@ -177,7 +177,7 @@ Pair **Hunyuan 3 Loader (NF4 Low VRAM+)** with **Hunyuan 3 Generate (Low VRAM Bu
 | **Hunyuan 3 Generate (Low VRAM)** | Quantized-friendly large generation | Varies | Moderate |
 | **Hunyuan 3 Generate (Low VRAM Budget)** | Low VRAM mode with smart heuristics + telemetry | Varies | Moderate |
 | **Hunyuan 3 Unload** | Free VRAM | - | Instant |
-| **Hunyuan 3 Soft Unload (Fast)** | ⚠️ Future use - see limitations below | - | - |
+| **Hunyuan 3 Soft Unload (Fast)** | Park model in CPU RAM for fast restore | - | Fast |
 | **Hunyuan 3 Force Unload (Nuclear)** | Aggressive VRAM clearing | - | Instant |
 | **Hunyuan 3 Clear Downstream Models** | Clear other models, keep Hunyuan | - | Instant |
 | **Hunyuan 3 GPU Info** | Diagnostic/GPU detection | - | Instant |
@@ -257,26 +257,36 @@ When running workflows in multiple browser tabs, models from other tabs stay in 
 | **Force Unload (Nuclear)** | After OOM errors, stuck VRAM |
 | **Soft Unload** | ⚠️ See limitations below |
 
-#### ⚠️ Soft Unload Node - Future/Limited Use
+#### ✅ Soft Unload Node - Fast VRAM Release (NEW!)
 
-The **Soft Unload** node is currently included for **future compatibility** but has significant limitations with current hardware and libraries:
+The **Soft Unload** node moves the model to CPU RAM instead of deleting it, allowing much faster restore times.
 
-**Does NOT work with (most common cases):**
-- **INT8/NF4 quantized models** - bitsandbytes locks tensors to their device
-- **BF16 with device_map="auto"** - creates meta tensors that can't be moved
+**Requirements:**
+- **bitsandbytes >= 0.48.2** (install with `pip install bitsandbytes>=0.48.2`)
+- Model loaded with `offload_mode='disabled'` (no meta tensors)
 
-**Only works with:**
-- BF16 model loaded entirely on a single GPU with NO offloading
-- This requires **~160GB+ VRAM** (no consumer/prosumer GPU exists yet)
+**Now works with:**
+- ✅ **INT8 quantized models** 
+- ✅ **NF4 quantized models**
+- ✅ **BF16 models** (loaded entirely on GPU)
 
-**Why it exists:**
-- Future GPUs may have 160GB+ VRAM
-- Future versions of bitsandbytes/accelerate may support moving quantized models to CPU
-- The infrastructure is ready when these limitations are resolved
+**Does NOT work with:**
+- ❌ Models loaded with `device_map` offloading (has meta tensors)
 
-**For current use cases, use instead:**
-- **"Clear Downstream Models"** - clears Flux/SAM2/etc while keeping Hunyuan cached
-- **"Force Unload"** - completely removes model when needed
+**Performance:**
+- Soft unload + restore: **~10-30 seconds** (scales with model size)
+- Full unload + reload from disk: **~2+ minutes**
+
+**Use Case - Multi-Model Workflows:**
+```
+[Hunyuan Generate] → [Soft Unload] → [Flux Detailer] → [SAM2] → [Restore to GPU] → [Next Hunyuan Gen]
+```
+This keeps Hunyuan in CPU RAM while other models use GPU, then restores without disk reload.
+
+**Actions:**
+- `soft_unload`: Move model to CPU RAM, free VRAM
+- `restore_to_gpu`: Move model back to GPU
+- `check_status`: Report current model location
 
 #### BF16 Loader Target Resolution Options
 

@@ -480,15 +480,25 @@ class HunyuanModelCache:
                 torch.cuda.empty_cache()
             return False
         
-        # Check if model is quantized (INT8/NF4) - these can't be moved with .to()
+        # Check if model is quantized (INT8/NF4)
+        # With bitsandbytes >= 0.48.2, quantized models CAN be moved with .to()
         is_quantized = cls._is_model_quantized(cls._cached_model)
         if is_quantized:
-            logger.warning("=" * 60)
-            logger.warning("SOFT UNLOAD NOT SUPPORTED FOR QUANTIZED MODELS")
-            logger.warning("INT8/NF4 quantized models use bitsandbytes which locks")
-            logger.warning("tensors to their device. Use full Unload instead.")
-            logger.warning("=" * 60)
-            return False
+            # Verify bitsandbytes version supports .to()
+            try:
+                import bitsandbytes
+                bnb_version = tuple(int(x) for x in bitsandbytes.__version__.split('.')[:3])
+                if bnb_version < (0, 48, 2):
+                    logger.warning("=" * 60)
+                    logger.warning("SOFT UNLOAD REQUIRES bitsandbytes >= 0.48.2")
+                    logger.warning(f"Your version: {bitsandbytes.__version__}")
+                    logger.warning("Upgrade with: pip install bitsandbytes>=0.48.2")
+                    logger.warning("=" * 60)
+                    return False
+                logger.info(f"Quantized model detected, using bitsandbytes {bitsandbytes.__version__} .to() support")
+            except Exception as e:
+                logger.warning(f"Could not verify bitsandbytes version: {e}")
+                # Continue anyway - let it fail naturally if unsupported
         
         # Check if model has meta tensors (from HF device_map offloading)
         has_meta = cls._has_meta_tensors(cls._cached_model)
@@ -614,14 +624,23 @@ class HunyuanModelCache:
             logger.info("Model is not on CPU, no restore needed")
             return True
         
-        # Check if model is quantized - can't restore these
+        # Check if model is quantized
+        # With bitsandbytes >= 0.48.2, quantized models CAN be restored with .to()
         if cls._is_model_quantized(cls._cached_model):
-            logger.error("Cannot restore quantized model - bitsandbytes does not support .to()")
-            logger.error("Model must be reloaded from disk. Clearing cache...")
-            cls._cached_model = None
-            cls._cached_path = None
-            cls._model_on_cpu = False
-            return False
+            try:
+                import bitsandbytes
+                bnb_version = tuple(int(x) for x in bitsandbytes.__version__.split('.')[:3])
+                if bnb_version < (0, 48, 2):
+                    logger.error("Cannot restore quantized model - bitsandbytes < 0.48.2")
+                    logger.error("Upgrade with: pip install bitsandbytes>=0.48.2")
+                    logger.error("Model must be reloaded from disk. Clearing cache...")
+                    cls._cached_model = None
+                    cls._cached_path = None
+                    cls._model_on_cpu = False
+                    return False
+                logger.info(f"Restoring quantized model using bitsandbytes {bitsandbytes.__version__}")
+            except Exception as e:
+                logger.warning(f"Could not verify bitsandbytes version: {e}")
         
         if device is None:
             device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
@@ -871,30 +890,29 @@ class HunyuanImage3Unload:
 
 class HunyuanImage3SoftUnload:
     """
-    [FUTURE/LIMITED USE] Fast VRAM release - moves model to CPU RAM instead of deleting.
+    Fast VRAM release - moves model to CPU RAM instead of deleting.
     
-    ⚠️ CURRENT LIMITATIONS - This node has very limited practical use today:
+    ✅ NOW WORKS WITH: (requires bitsandbytes >= 0.48.2)
+    - INT8 quantized models
+    - NF4 quantized models  
+    - BF16 models loaded entirely on GPU
     
-    Does NOT work with (most common cases):
-    - INT8/NF4 quantized models (bitsandbytes locks tensors to device)
-    - BF16 with device_map="auto" (has meta tensors that can't move)
+    ⚠️ Does NOT work with:
+    - Models loaded with device_map offloading (has meta tensors)
+    - Use offload_mode='disabled' in loader to enable soft unload
     
-    Only works with:
-    - BF16 model loaded entirely on GPU with NO offloading
-    - This requires ~160GB+ VRAM (no consumer GPU exists yet)
+    BENEFITS:
+    - Soft unload + restore: ~10-30 seconds (scales with model size)
+    - Full unload + reload from disk: ~2+ minutes
     
-    WHY KEEP THIS NODE?
-    - Future hardware may have 160GB+ VRAM
-    - Future bitsandbytes/accelerate versions may support .to(cpu)
-    - Provides infrastructure for when these limitations are resolved
+    USE CASE:
+    Run Hunyuan → Soft Unload → Run downstream models (Flux, SAM2, etc.)
+    → Restore Hunyuan → Generate again (no disk reload needed!)
     
-    FOR CURRENT USE CASES, USE INSTEAD:
-    - "Clear Downstream Models" - clears other models, keeps Hunyuan cached
-    - "Force Unload" - completely removes model when needed
-    
-    When it works (future), benefits are:
-    - Soft unload + reload: ~20-30 seconds total
-    - Full unload + reload: ~2+ minutes (disk I/O bottleneck)
+    ACTIONS:
+    - soft_unload: Move model from GPU to CPU RAM, free VRAM
+    - restore_to_gpu: Move model back to GPU for inference
+    - check_status: Report current model location
     """
 
     @classmethod
@@ -939,8 +957,12 @@ class HunyuanImage3SoftUnload:
                 status = "Model already on CPU"
                 success = True
             elif is_quantized:
-                # Quantized model detected - give specific message
-                status = "⚠️ INT8/NF4 quantized models cannot be soft-unloaded (bitsandbytes limitation). Use Force Unload instead."
+                # Quantized model detected - check bitsandbytes version
+                try:
+                    import bitsandbytes
+                    status = f"⚠️ Soft unload failed. bitsandbytes {bitsandbytes.__version__} - upgrade to >=0.48.2 for quantized model support."
+                except ImportError:
+                    status = "⚠️ bitsandbytes not found. Install with: pip install bitsandbytes>=0.48.2"
                 success = False
             elif has_meta:
                 # Model loaded with device_map offloading
