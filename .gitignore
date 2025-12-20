@@ -149,3 +149,16 @@ api_config.ini
 
 # Local History
 .history/
+
+# Build artifacts
+node.zip
+*.zip
+
+# Test output files
+syntax_check.txt
+syntax_result.txt
+test_output*.png
+
+# Python cache (additional patterns)
+*.pyc
+.python-version
