@@ -41,7 +41,9 @@ try:
         HUNYUAN_INSTRUCT_FOLDER_NAME,
         get_available_hunyuan_models,
         patch_dynamic_cache_dtype,
+        patch_hunyuan_static_cache_device,
         patch_pipeline_pre_vae_cleanup,
+        patch_static_cache_lazy_init,
         patch_to_device_for_instruct,
         clear_generation_cache,
         resolve_hunyuan_model_path,
@@ -53,7 +55,9 @@ except ImportError:
             HUNYUAN_INSTRUCT_FOLDER_NAME,
             get_available_hunyuan_models,
             patch_dynamic_cache_dtype,
+            patch_hunyuan_static_cache_device,
             patch_pipeline_pre_vae_cleanup,
+            patch_static_cache_lazy_init,
             patch_to_device_for_instruct,
             clear_generation_cache,
             resolve_hunyuan_model_path,
@@ -62,7 +66,9 @@ except ImportError:
     except ImportError:
         SHARED_UTILS_AVAILABLE = False
         patch_dynamic_cache_dtype = None
+        patch_hunyuan_static_cache_device = None
         patch_pipeline_pre_vae_cleanup = None
+        patch_static_cache_lazy_init = None
         patch_to_device_for_instruct = None
         clear_generation_cache = None
 
@@ -109,19 +115,58 @@ DYNAMIC_PROMPT_MAP = {
     "think_recaption": "en_unified",    # CoT + rewriting — unified handles all
 }
 
-# Resolution presets
-# Format: "WxH (ratio)": (height, width) - stored as (H,W) for API's HxW format
+# Resolution presets — all 33 bucket resolutions from ResolutionGroup(base_size=1024)
+# Format: "WxH (ratio description)": (height, width) - stored as (H,W) for API's HxW format
+#
+# These are the exact resolutions the model was trained on (~1MP each).
+# Ordered: tallest portrait → square → widest landscape.
+#
+# NOTE on larger sizes: The model's tokenizer has size tokens for base_size
+# up to 8192, but the diffusion head was only trained at base_size=1024.
+# Specifying larger sizes (2MP+) produces artifacts. Future Tencent releases
+# may support higher base sizes.
 INSTRUCT_RESOLUTION_PRESETS = {
     "Auto (model predicts)": "auto",
+    # ---- Extreme portrait (1:4 to 1:3) ----
+    "512x2048 (1:4 Tall)": (2048, 512),
+    "512x1984 (~1:4 Tall)": (1984, 512),
+    "512x1920 (4:15 Tall)": (1920, 512),
+    "512x1856 (~1:4 Tall)": (1856, 512),
+    "512x1792 (2:7 Tall)": (1792, 512),
+    "512x1728 (~1:3 Tall)": (1728, 512),
+    "512x1664 (4:13 Tall)": (1664, 512),
+    "512x1600 (8:25 Tall)": (1600, 512),
+    "512x1536 (1:3 Portrait)": (1536, 512),
+    # ---- Tall portrait (9:23 to 3:5) ----
+    "576x1472 (9:23 Portrait)": (1472, 576),
+    "640x1408 (5:11 Portrait)": (1408, 640),
+    "704x1344 (11:21 Portrait)": (1344, 704),
+    "768x1280 (3:5 Portrait)": (1280, 768),
+    # ---- Standard portrait (13:19 to 15:17) ----
+    "832x1216 (13:19 Portrait)": (1216, 832),
+    "896x1152 (7:9 Portrait)": (1152, 896),
+    "960x1088 (15:17 Portrait)": (1088, 960),
+    # ---- Square ----
     "1024x1024 (1:1 Square)": (1024, 1024),
-    "1024x576 (16:9 Landscape)": (576, 1024),
-    "576x1024 (9:16 Portrait)": (1024, 576),
-    "1024x672 (3:2 Landscape)": (672, 1024),
-    "672x1024 (2:3 Portrait)": (1024, 672),
-    "1024x768 (4:3 Landscape)": (768, 1024),
-    "768x1024 (3:4 Portrait)": (1024, 768),
-    "1024x864 (~6:5 Landscape)": (864, 1024),
-    "864x1024 (~5:6 Portrait)": (1024, 864),
+    # ---- Standard landscape (17:15 to 19:13) ----
+    "1088x960 (17:15 Landscape)": (960, 1088),
+    "1152x896 (9:7 Landscape)": (896, 1152),
+    "1216x832 (19:13 Landscape)": (832, 1216),
+    # ---- Wide landscape (5:3 to 11:5) ----
+    "1280x768 (5:3 Landscape)": (768, 1280),
+    "1344x704 (21:11 Landscape)": (704, 1344),
+    "1408x640 (11:5 Landscape)": (640, 1408),
+    "1472x576 (23:9 Landscape)": (576, 1472),
+    # ---- Extreme landscape (3:1 to 4:1) ----
+    "1536x512 (3:1 Wide)": (512, 1536),
+    "1600x512 (25:8 Wide)": (512, 1600),
+    "1664x512 (13:4 Wide)": (512, 1664),
+    "1728x512 (27:8 Wide)": (512, 1728),
+    "1792x512 (7:2 Wide)": (512, 1792),
+    "1856x512 (29:8 Wide)": (512, 1856),
+    "1920x512 (15:4 Wide)": (512, 1920),
+    "1984x512 (31:8 Wide)": (512, 1984),
+    "2048x512 (4:1 Wide)": (512, 2048),
 }
 
 RESOLUTION_LIST = list(INSTRUCT_RESOLUTION_PRESETS.keys())
@@ -667,21 +712,20 @@ def _aggressive_vram_cleanup(model: Any, context: str = "generation") -> None:
     """
     Aggressive VRAM cleanup before generation to maximize free memory.
     
-    This goes beyond simple gc.collect() + empty_cache() by also clearing
-    any stale KV cache from previous generation runs, which can hold
-    1-4GB of VRAM.
-    
-    Args:
-        model: The Hunyuan model
-        context: Description of what we're cleaning up for (for logging)
+    Clears stale KV cache AND flushes PyTorch's CUDA caching allocator.
+    The caching allocator can hold 50-80GB of reserved-but-unused VRAM
+    after model loading and block swap setup, causing OOM even when
+    actual tensor allocations are well within budget.
     """
-    # First clear any stale generation cache from previous runs
+    # Clear any stale generation cache from previous runs
     if SHARED_UTILS_AVAILABLE and clear_generation_cache:
         clear_generation_cache(model)
-    else:
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    
+    # Always run gc + empty_cache regardless of the above
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
     
     # Log VRAM state after cleanup
     if torch.cuda.is_available():
@@ -769,6 +813,21 @@ class InstructModelCache:
     def get(self, model_path: str) -> Optional[Any]:
         """Get cached model if it matches the requested path."""
         if self.model is not None and self.model_path == model_path:
+            # Check if model was gutted by unload (all param storage freed)
+            try:
+                first_param = next(self.model.parameters())
+                if first_param.numel() == 0:
+                    logger.info("Cached model is gutted (was unloaded) — treating as cache miss")
+                    self.model = None
+                    self.model_path = None
+                    self.model_info = None
+                    return None
+            except StopIteration:
+                logger.info("Cached model has no parameters — treating as cache miss")
+                self.model = None
+                self.model_path = None
+                self.model_info = None
+                return None
             logger.info(f"Using cached Instruct model: {model_path}")
             return self.model
         return None
@@ -784,24 +843,431 @@ class InstructModelCache:
         logger.info(f"Cached Instruct model: {model_path}")
     
     def clear(self) -> None:
-        """Clear the cached model."""
+        """Clear the cached model and free all RAM/VRAM.
+        
+        This method carefully breaks all circular references before deleting
+        the model to ensure both CPU RAM and GPU VRAM are actually freed.
+        
+        Without explicit cleanup, these circular refs prevent gc from freeing
+        ~80GB+ of transformer block tensors in RAM:
+          model → _block_swap_manager → model (via manager.model)
+          model → _block_swap_manager → blocks[] → model.model.layers[i]
+          model → vae → decode closure → model (via monkey-patch)
+        """
         if self.model is not None:
             logger.info(f"Clearing cached model: {self.model_path}")
             
-            # Remove block swap hooks before clearing
+            # Track RAM before cleanup
+            import psutil
+            ram_before = psutil.Process().memory_info().rss / 1024**3
+            
+            # Step 1: Clean up BlockSwapManager (MUST happen before del model)
+            # This breaks circular refs and releases block tensor references
             if hasattr(self.model, '_block_swap_manager'):
                 manager = self.model._block_swap_manager
-                if manager and manager.hooks_installed:
-                    manager.remove_hooks()
-                    logger.info("Removed block swap hooks")
+                if manager is not None:
+                    manager.cleanup()  # Full cleanup: hooks + refs + streams
+                    logger.info("BlockSwapManager cleaned up")
+                self.model._block_swap_manager = None
             
+            # Step 2: Unpatch VAE decode closure (holds ref to model)
+            try:
+                if SHARED_UTILS_AVAILABLE:
+                    from .hunyuan_shared import unpatch_pipeline_pre_vae_cleanup
+                    unpatch_pipeline_pre_vae_cleanup(self.model)
+            except ImportError:
+                try:
+                    from hunyuan_shared import unpatch_pipeline_pre_vae_cleanup
+                    unpatch_pipeline_pre_vae_cleanup(self.model)
+                except ImportError:
+                    pass
+            except Exception as e:
+                logger.debug(f"VAE unpatch during cleanup: {e}")
+            
+            # Step 2a: Remove external monkey-patches on submodules.
+            # Other custom nodes (e.g. seedvr2_videoupscaler) may patch
+            # methods on our model's submodules with closures that capture
+            # the model, keeping the entire tree alive after unload.
+            import types as _types
+            import ctypes as _ct
+            ext_broken = 0
+            try:
+                for _, submod in self.model.named_modules():
+                    for attr_name in list(vars(submod).keys()):
+                        attr = vars(submod).get(attr_name)
+                        if attr is None:
+                            continue
+                        closure = None
+                        if isinstance(attr, _types.FunctionType):
+                            closure = attr.__closure__
+                        elif isinstance(attr, _types.MethodType):
+                            closure = getattr(attr.__func__, '__closure__', None)
+                        if closure:
+                            for cell in closure:
+                                try:
+                                    _ct.pythonapi.PyCell_Set(
+                                        _ct.py_object(cell),
+                                        _ct.py_object(None))
+                                    ext_broken += 1
+                                except Exception:
+                                    pass
+                            try:
+                                delattr(submod, attr_name)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+            if ext_broken:
+                logger.info(f"  Broke {ext_broken} external monkey-patch "
+                            f"closure cells on submodules")
+            
+            # Step 2b: Cleanly reverse all monkey-patches on the model.
+            # RESTORE originals instead of breaking closure cells to avoid
+            # corrupting the class for future loads.
+            try:
+                try:
+                    from .hunyuan_shared import unpatch_hunyuan_generate_image
+                except ImportError:
+                    from hunyuan_shared import unpatch_hunyuan_generate_image
+                unpatch_hunyuan_generate_image(self.model)
+            except ImportError:
+                # Fallback: just delete the instance-level generate_image
+                if hasattr(self.model, 'generate_image'):
+                    try:
+                        del self.model.generate_image
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning(f"Error during unpatch_hunyuan_generate_image: {e}")
+            
+            try:
+                try:
+                    from .hunyuan_shared import unpatch_pipeline_pre_vae_cleanup
+                except ImportError:
+                    from hunyuan_shared import unpatch_pipeline_pre_vae_cleanup
+                unpatch_pipeline_pre_vae_cleanup(self.model)
+            except (ImportError, Exception):
+                pass
+            
+            # Step 2c: Nuclear gc closure scan — break ANY closure cell
+            # that still references this model or its submodules
+            _cell_sentinel = None
+            cell_type = type((lambda: _cell_sentinel).__closure__[0])
+            gc.collect()
+            nuked = 0
+            model_ref = self.model  # local ref before we del later
+            # Pre-build set of all module ids for O(1) lookup
+            model_module_ids = set()
+            try:
+                for _, _sub in model_ref.named_modules():
+                    model_module_ids.add(id(_sub))
+            except Exception:
+                pass
+            model_module_ids.add(id(model_ref))
+            
+            for _obj in gc.get_objects():
+                if type(_obj) is not cell_type:
+                    continue
+                try:
+                    _val = _obj.cell_contents
+                except ValueError:
+                    continue
+                # CRITICAL: skip class objects (types) — Python stores
+                # __class__ in a closure cell for super(); breaking it
+                # destroys super() for the entire class permanently.
+                if isinstance(_val, torch.nn.Module) and not isinstance(_val, type) and id(_val) in model_module_ids:
+                    import ctypes as _ct
+                    _ct.pythonapi.PyCell_Set(
+                        _ct.py_object(_obj), _ct.py_object(None))
+                    nuked += 1
+            del model_module_ids
+            if nuked:
+                logger.info(f"  Nuclear closure scan broke {nuked} cells")
+                gc.collect()
+            del model_ref
+            
+            # Step 3: Clear generation caches (KV cache, etc.)
+            if SHARED_UTILS_AVAILABLE and clear_generation_cache:
+                try:
+                    clear_generation_cache(self.model)
+                except Exception:
+                    pass
+            
+            # Step 4: Remove any remaining accelerate hooks
+            try:
+                from accelerate.hooks import remove_hook_from_module
+                for name, module in self.model.named_modules():
+                    if hasattr(module, '_hf_hook'):
+                        remove_hook_from_module(module)
+            except ImportError:
+                pass
+            except Exception:
+                pass
+            
+            # Step 5: Clear attached metadata (break any remaining refs)
+            for attr in ('_hunyuan_info', '_hunyuan_path', '_block_swap_manager'):
+                if hasattr(self.model, attr):
+                    try:
+                        setattr(self.model, attr, None)
+                    except Exception:
+                        pass
+                    
+            # Step 6: Free tensor storage in-place (replaces model.to('cpu'))
+            # model.to('cpu') would create new CRT heap allocations for every
+            # GPU tensor, which Windows never returns to the OS. Instead,
+            # replace every param/buffer .data with empty(0) to free storage
+            # directly — both GPU and CPU tensors.
+            #
+            # CRITICAL: Also handles bitsandbytes INT8 internals (.CB, .SCB,
+            # .state) and hunts ALL reachable CUDA tensors via gc referent walk.
+            try:
+                # Checkpoint: VRAM before gutting
+                vram_before_gut = 0
+                if torch.cuda.is_available():
+                    vram_before_gut = torch.cuda.memory_allocated(0)
+                    logger.info(f"  VRAM allocated before gutting: "
+                               f"{vram_before_gut/1024**3:.1f}GB")
+                
+                gpu_freed = 0
+                cpu_freed = 0
+                
+                # Phase 1a: Clear bitsandbytes INT8 internals FIRST.
+                # Linear8bitLt stores weight data in weight.CB/SCB and
+                # child.state which param.data= doesn't touch.
+                bnb_cleared = 0
+                try:
+                    from bitsandbytes.nn import Linear8bitLt
+                    for mod_name, module in self.model.named_modules():
+                        if isinstance(module, Linear8bitLt):
+                            w = module.weight
+                            for attr in ('CB', 'SCB'):
+                                t = getattr(w, attr, None)
+                                if t is not None and isinstance(t, torch.Tensor):
+                                    nb = t.numel() * t.element_size()
+                                    if t.device.type == 'cuda':
+                                        gpu_freed += nb
+                                    else:
+                                        cpu_freed += nb
+                                    setattr(w, attr, None)
+                                    bnb_cleared += 1
+                            # Clear matmul state (holds CxB, CB, SCB copies)
+                            if hasattr(module, 'state'):
+                                state = module.state
+                                for attr in ('CxB', 'CB', 'SCB', 'SB',
+                                             'idx', 'outlier_cols'):
+                                    t = getattr(state, attr, None)
+                                    if t is not None and isinstance(t, torch.Tensor):
+                                        nb = t.numel() * t.element_size()
+                                        if t.device.type == 'cuda':
+                                            gpu_freed += nb
+                                        else:
+                                            cpu_freed += nb
+                                        setattr(state, attr, None)
+                                        bnb_cleared += 1
+                except ImportError:
+                    pass
+                if bnb_cleared:
+                    logger.info(f"  Cleared {bnb_cleared} bitsandbytes INT8 "
+                               f"internal tensors")
+                
+                # Phase 1b: Gut registered parameters and buffers
+                for param in self.model.parameters():
+                    nbytes = param.data.numel() * param.data.element_size()
+                    if param.data.device.type == 'cuda':
+                        gpu_freed += nbytes
+                    else:
+                        cpu_freed += nbytes
+                    param.data = torch.empty(0)
+                    if param.grad is not None:
+                        param.grad = None
+                for buf in self.model.buffers():
+                    nbytes = buf.data.numel() * buf.data.element_size()
+                    if buf.data.device.type == 'cuda':
+                        gpu_freed += nbytes
+                    else:
+                        cpu_freed += nbytes
+                    buf.data = torch.empty(0)
+                
+                logger.info(f"  Phase 1: {gpu_freed/1024**3:.1f}GB GPU + "
+                           f"{cpu_freed/1024**3:.1f}GB CPU from "
+                           f"params/buffers/bnb internals")
+                
+                # Checkpoint: flush and measure after Phase 1
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    vram_after_p1 = torch.cuda.memory_allocated(0)
+                    logger.info(f"  VRAM after Phase 1 + gc: "
+                               f"{vram_after_p1/1024**3:.1f}GB "
+                               f"(released {(vram_before_gut - vram_after_p1)/1024**3:.1f}GB)")
+                
+                # Phase 2: Hunt non-parameter tensor attributes on modules
+                attr_gpu_freed = 0
+                attr_cpu_freed = 0
+                attr_count = 0
+                param_ids = set(id(p) for p in self.model.parameters())
+                buffer_ids = set(id(b) for b in self.model.buffers())
+                skip_ids = param_ids | buffer_ids
+                
+                for mod_name, module in self.model.named_modules():
+                    for attr_name in list(vars(module).keys()):
+                        if attr_name in ('_parameters', '_buffers', '_modules',
+                                        '_backward_hooks', '_forward_hooks',
+                                        '_forward_pre_hooks', '_state_dict_hooks',
+                                        '_load_state_dict_pre_hooks', 'training'):
+                            continue
+                        try:
+                            val = getattr(module, attr_name)
+                        except Exception:
+                            continue
+                        if isinstance(val, torch.Tensor) and id(val) not in skip_ids:
+                            nbytes = val.numel() * val.element_size()
+                            if val.device.type == 'cuda':
+                                attr_gpu_freed += nbytes
+                                attr_count += 1
+                            elif val.device.type == 'cpu' and nbytes > 0:
+                                attr_cpu_freed += nbytes
+                                attr_count += 1
+                            try:
+                                setattr(module, attr_name, None)
+                            except Exception:
+                                pass
+                
+                if attr_count > 0:
+                    logger.info(f"  Phase 2: {attr_gpu_freed/1024**3:.1f}GB GPU + "
+                               f"{attr_cpu_freed/1024**3:.1f}GB CPU from "
+                               f"{attr_count} module tensor attributes")
+                
+                # Phase 3: Nuclear walk — find ALL CUDA tensors reachable from
+                # the model via gc referent traversal. This catches tensors
+                # stored in nested dicts, lists, GenerationConfig, custom
+                # cache objects, etc. that named_modules() can't reach.
+                gc.collect()
+                if torch.cuda.is_available():
+                    vram_after_p2 = torch.cuda.memory_allocated(0)
+                    if vram_after_p2 > 1 * 1024**3:  # >1GB still on GPU
+                        logger.info(f"  Phase 3: {vram_after_p2/1024**3:.1f}GB "
+                                   f"still allocated — hunting reachable tensors...")
+                        
+                        nuked_gpu = 0
+                        nuked_count = 0
+                        visited = set()
+                        # Walk all objects reachable from the model
+                        stack = [self.model]
+                        while stack:
+                            obj = stack.pop()
+                            obj_id = id(obj)
+                            if obj_id in visited:
+                                continue
+                            visited.add(obj_id)
+                            
+                            if isinstance(obj, torch.Tensor) and obj.device.type == 'cuda':
+                                nb = obj.numel() * obj.element_size()
+                                if nb > 0:
+                                    nuked_gpu += nb
+                                    nuked_count += 1
+                                    obj.data = torch.empty(0)
+                                continue  # Don't recurse into tensor internals
+                            
+                            # Recurse into containers and object attributes
+                            try:
+                                if isinstance(obj, dict):
+                                    stack.extend(obj.values())
+                                elif isinstance(obj, (list, tuple)):
+                                    stack.extend(obj)
+                                elif hasattr(obj, '__dict__') and not isinstance(obj, type):
+                                    stack.extend(vars(obj).values())
+                            except Exception:
+                                pass
+                        
+                        del visited
+                        if nuked_count:
+                            logger.info(f"  Phase 3: Nuked {nuked_count} reachable "
+                                       f"CUDA tensors ({nuked_gpu/1024**3:.1f}GB)")
+                        
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        vram_after_p3 = torch.cuda.memory_allocated(0)
+                        logger.info(f"  VRAM after Phase 3 + gc: "
+                                   f"{vram_after_p3/1024**3:.1f}GB")
+                
+                # Final summary
+                if torch.cuda.is_available():
+                    vram_final = torch.cuda.memory_allocated(0)
+                    total_vram_released = vram_before_gut - vram_final
+                    logger.info(f"  Total VRAM actually released: "
+                               f"{total_vram_released/1024**3:.1f}GB "
+                               f"({vram_before_gut/1024**3:.1f} → "
+                               f"{vram_final/1024**3:.1f}GB)")
+                
+            except Exception as e:
+                logger.warning(f"  Tensor gutting error: {e}")
+                import traceback
+                traceback.print_exc()
+            
+            # Step 7: Delete model and clear cache state
             del self.model
             self.model = None
             self.model_path = None
             self.model_info = None
+            
+            # Step 8: Aggressive garbage collection + VRAM release
+            # Multiple rounds to handle nested reference cycles
             gc.collect()
+            gc.collect()
+            gc.collect()
+            
             if torch.cuda.is_available():
+                # Diagnostic: check reserved vs allocated before empty_cache
+                alloc_before = torch.cuda.memory_allocated(0) / 1024**3
+                reserved_before = torch.cuda.memory_reserved(0) / 1024**3
+                free_before, _ = torch.cuda.mem_get_info(0)
+                free_before_gb = free_before / 1024**3
+                logger.info(f"  Pre-empty_cache: allocated={alloc_before:.1f}GB, "
+                           f"reserved={reserved_before:.1f}GB, "
+                           f"CUDA free={free_before_gb:.1f}GB")
+                
+                torch.cuda.synchronize()
                 torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                
+                alloc_after = torch.cuda.memory_allocated(0) / 1024**3
+                reserved_after = torch.cuda.memory_reserved(0) / 1024**3
+                free_after, _ = torch.cuda.mem_get_info(0)
+                free_after_gb = free_after / 1024**3
+                logger.info(f"  Post-empty_cache: allocated={alloc_after:.1f}GB, "
+                           f"reserved={reserved_after:.1f}GB, "
+                           f"CUDA free={free_after_gb:.1f}GB")
+                
+                if reserved_after > 1.0:
+                    # Reserved pool didn't release — try nuclear options
+                    logger.warning(f"  empty_cache left {reserved_after:.1f}GB reserved!")
+                    
+                    # Option A: Reset the CUDA caching allocator entirely
+                    # This forces ALL reserved memory back to CUDA
+                    try:
+                        torch.cuda.memory.empty_cache()  # redundant but try both paths
+                    except Exception:
+                        pass
+                    
+                    # Option B: Force a CUDA context reset on all devices
+                    # by creating and immediately destroying a small tensor
+                    for i in range(torch.cuda.device_count()):
+                        try:
+                            tmp = torch.zeros(1, device=f'cuda:{i}')
+                            del tmp
+                        except Exception:
+                            pass
+                    
+                    gc.collect()
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    
+                    reserved_final = torch.cuda.memory_reserved(0) / 1024**3
+                    free_final, _ = torch.cuda.mem_get_info(0)
+                    logger.info(f"  After nuclear: reserved={reserved_final:.1f}GB, "
+                               f"CUDA free={free_final/1024**3:.1f}GB")
 
 
 # Global cache instance
@@ -830,6 +1296,21 @@ class HunyuanInstructLoader:
     FUNCTION = "load_model"
     RETURN_TYPES = ("HUNYUAN_INSTRUCT_MODEL",)
     RETURN_NAMES = ("model",)
+    
+    @classmethod
+    def IS_CHANGED(cls, force_reload=False, **kwargs):
+        if force_reload:
+            return float("nan")
+        # If model was unloaded or gutted, force re-execution to reload
+        if _instruct_cache.model is None:
+            return float("nan")
+        try:
+            first_param = next(_instruct_cache.model.parameters())
+            if first_param.numel() == 0:
+                return float("nan")
+        except (StopIteration, Exception):
+            return float("nan")
+        return False
     
     @classmethod
     def INPUT_TYPES(cls):
@@ -924,7 +1405,41 @@ class HunyuanInstructLoader:
             if cached is not None:
                 return (cached,)
         else:
+            logger.info("Force reload: cleaning up previous model...")
+            import psutil
+            ram_before = psutil.Process().memory_info().rss / 1024**3
+            
+            # Step 1: Our cache clear — breaks circular refs (9-step cleanup)
             _instruct_cache.clear()
+            
+            # Step 2: Multiple gc rounds to collect broken cycles
+            gc.collect()
+            gc.collect()
+            gc.collect()
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
+            # Step 3: Final gc (orphan hunt removed — it was destroying
+            # other models' parameters across the process)
+            gc.collect()
+            gc.collect()
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
+            # Force Windows to return freed memory to OS
+            try:
+                from .hunyuan_shared import force_windows_memory_release
+            except ImportError:
+                from hunyuan_shared import force_windows_memory_release
+            force_windows_memory_release()
+            
+            ram_after = psutil.Process().memory_info().rss / 1024**3
+            logger.info(f"  Force reload cleanup: RAM {ram_before:.1f}GB → {ram_after:.1f}GB "
+                       f"(freed {ram_before - ram_after:.1f}GB)")
         
         # Detect model type (includes quant_type and CFG detection from config.json)
         model_info = detect_model_type(model_path)
@@ -1203,6 +1718,8 @@ class HunyuanInstructLoader:
             logger.info("Applying dtype compatibility patches...")
             if patch_dynamic_cache_dtype:
                 patch_dynamic_cache_dtype()
+            if patch_static_cache_lazy_init:
+                patch_static_cache_lazy_init()
             
             # CRITICAL: Fix upstream to_device() to handle dict inputs.
             # Without this, image editing fails because the vision encoder's
@@ -1215,6 +1732,10 @@ class HunyuanInstructLoader:
             if patch_pipeline_pre_vae_cleanup:
                 patch_pipeline_pre_vae_cleanup(model, enabled=True)
                 logger.info("Applied pre-VAE memory cleanup patch")
+            
+            # Fix HunyuanStaticCache device mismatch on multi-GPU setups
+            if patch_hunyuan_static_cache_device:
+                patch_hunyuan_static_cache_device(model)
         
         # Setup block swap for models with blocks_to_swap > 0
         # Works for NF4 (proven), INT8 (Int8Params.to() supports device movement),
@@ -1564,10 +2085,10 @@ class HunyuanInstructGenerate:
             # when force_reload=False (model is reused from cache).
             if SHARED_UTILS_AVAILABLE and clear_generation_cache:
                 clear_generation_cache(model)
-            else:
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
             
             return (image_tensor, cot_text or "", status)
             
@@ -1853,10 +2374,10 @@ class HunyuanInstructImageEdit:
             # CRITICAL: Clear KV cache after generation to prevent OOM/stale state on next run
             if SHARED_UTILS_AVAILABLE and clear_generation_cache:
                 clear_generation_cache(model)
-            else:
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
             
             return (image_tensor, cot_text or "", status)
             
@@ -1919,7 +2440,9 @@ class HunyuanInstructMultiFusion:
     """
     Multi-image fusion with Instruct model.
     
-    Combines elements from 2-3 reference images based on instruction.
+    Combines elements from 2-5 reference images based on instruction.
+    The model officially supports up to 3 images; 4-5 are experimental
+    and require more VRAM.
     Examples:
     - "Based on image 1's logo, create a fridge magnet with image 2's material"
     - "Combine the style of image 1 with the subject from image 2"
@@ -1942,7 +2465,7 @@ class HunyuanInstructMultiFusion:
                     "default": "Combine the style of image 1 with elements from image 2",
                     "tooltip": (
                         "Instruction describing how to combine the images. "
-                        "Reference images as 'image 1', 'image 2', 'image 3'. "
+                        "Reference images as 'image 1', 'image 2', 'image 3', etc. "
                         "Examples: 'Based on image 1 logo, create a fridge magnet with image 2 material', "
                         "'Let the cat from image 1 take a selfie with the cat from image 2, "
                         "with image 3 as background'. Works with both English and Chinese prompts."
@@ -1958,6 +2481,8 @@ class HunyuanInstructMultiFusion:
             "optional": {
                 "image_2": ("IMAGE",),
                 "image_3": ("IMAGE",),
+                "image_4": ("IMAGE", {"tooltip": "Experimental — model officially supports up to 3, but the pipeline accepts more. Increases VRAM usage significantly."}),
+                "image_5": ("IMAGE", {"tooltip": "Experimental — model officially supports up to 3, but the pipeline accepts more. Increases VRAM usage significantly."}),
                 "bot_task": (BOT_TASK_MODES, {
                     "default": "image",
                     "tooltip": (
@@ -1980,7 +2505,11 @@ class HunyuanInstructMultiFusion:
                 }),
                 "resolution": (RESOLUTION_LIST, {
                     "default": "1024x1024 (1:1 Square)",
-                    "tooltip": "Output image resolution. Auto lets the model predict optimal size."
+                    "tooltip": (
+                        "Output image resolution. Auto lets the model predict aspect ratio "
+                        "(often unpredictable with multiple input images of different sizes).\n"
+                        "Selecting a specific resolution gives deterministic output dimensions."
+                    )
                 }),
                 "steps": ("INT", {
                     "default": -1,
@@ -2033,6 +2562,8 @@ class HunyuanInstructMultiFusion:
         seed: int = -1,
         image_2: Optional[torch.Tensor] = None,
         image_3: Optional[torch.Tensor] = None,
+        image_4: Optional[torch.Tensor] = None,
+        image_5: Optional[torch.Tensor] = None,
         bot_task: str = "think_recaption",
         system_prompt: str = "dynamic",
         resolution: str = "1024x1024 (1:1 Square)",
@@ -2053,17 +2584,12 @@ class HunyuanInstructMultiFusion:
         temp_files.append(path1)
         image_paths.append(path1)
         
-        # Image 2 is optional
-        if image_2 is not None:
-            path2 = tensor_to_temp_path(image_2)
-            temp_files.append(path2)
-            image_paths.append(path2)
-        
-        # Image 3 is optional
-        if image_3 is not None:
-            path3 = tensor_to_temp_path(image_3)
-            temp_files.append(path3)
-            image_paths.append(path3)
+        # Images 2-5 are optional
+        for img in [image_2, image_3, image_4, image_5]:
+            if img is not None:
+                path = tensor_to_temp_path(img)
+                temp_files.append(path)
+                image_paths.append(path)
         
         try:
             # Get model info
@@ -2170,10 +2696,10 @@ class HunyuanInstructMultiFusion:
             # CRITICAL: Clear KV cache after generation to prevent OOM/stale state on next run
             if SHARED_UTILS_AVAILABLE and clear_generation_cache:
                 clear_generation_cache(model)
-            else:
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
             
             return (image_tensor, cot_text or "", status)
             
@@ -2247,28 +2773,91 @@ class HunyuanInstructUnload:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {},
+            "required": {
+                "enabled": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Toggle unload on/off. When False, node passes through without unloading. "
+                               "Useful for keeping the node wired in your workflow but skipping unload "
+                               "when you want to keep the model loaded for multiple runs."
+                }),
+            },
             "optional": {
                 "trigger": ("*", {"default": None}),
             }
         }
     
-    def unload(self, trigger=None) -> Tuple[str]:
-        """Unload the cached model."""
+    def unload(self, enabled: bool = True, trigger=None) -> Tuple[str]:
+        """Unload the cached model and hunt orphaned RAM tensors."""
+        if not enabled:
+            logger.info("Instruct unload skipped (disabled)")
+            return ("Unload skipped (disabled)",)
+        
+        import psutil
+        ram_before = psutil.Process().memory_info().rss / 1024**3
+        
+        # Step 1: Clear our instruct cache (9-step circular ref cleanup)
         _instruct_cache.clear()
         
+        # Step 2: Also clear base model cache if loaded
+        if SHARED_UTILS_AVAILABLE:
+            try:
+                from .hunyuan_shared import HunyuanModelCache
+                if HunyuanModelCache._cached_model is not None:
+                    logger.info("Also clearing base HunyuanModelCache...")
+                    HunyuanModelCache.clear()
+            except ImportError:
+                try:
+                    from hunyuan_shared import HunyuanModelCache
+                    if HunyuanModelCache._cached_model is not None:
+                        logger.info("Also clearing base HunyuanModelCache...")
+                        HunyuanModelCache.clear()
+                except ImportError:
+                    pass
+        
+        # Step 3: Extra gc rounds to catch remaining cycles
         gc.collect()
+        gc.collect()
+        gc.collect()
+        
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-            
+        
+        # Step 4: Final gc + VRAM flush (orphan hunt removed — it was gutting
+        # ALL nn.Module instances in the process including downstream models
+        # like Marigold/segmentation, causing "weight should have at least
+        # three dimensions" errors)
+        gc.collect()
+        gc.collect()
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        # Force Windows to return freed memory to OS
+        try:
+            from .hunyuan_shared import force_windows_memory_release
+        except ImportError:
+            from hunyuan_shared import force_windows_memory_release
+        force_windows_memory_release()
+        
+        if torch.cuda.is_available():
             # Report VRAM status
             free_bytes, total_bytes = torch.cuda.mem_get_info(0)
             free_gb = free_bytes / 1024**3
             total_gb = total_bytes / 1024**3
-            status = f"Model unloaded. VRAM: {free_gb:.1f}GB free / {total_gb:.1f}GB total"
+            
+            # Report RAM status
+            ram_after = psutil.Process().memory_info().rss / 1024**3
+            ram_freed = ram_before - ram_after
+            
+            status = (f"Model unloaded. "
+                     f"VRAM: {free_gb:.1f}GB free / {total_gb:.1f}GB total. "
+                     f"RAM: {ram_after:.1f}GB (freed {ram_freed:.1f}GB)")
         else:
-            status = "Model unloaded (no CUDA)"
+            ram_after = psutil.Process().memory_info().rss / 1024**3
+            ram_freed = ram_before - ram_after
+            status = f"Model unloaded (no CUDA). RAM: {ram_after:.1f}GB (freed {ram_freed:.1f}GB)"
         
         logger.info(status)
         return (status,)

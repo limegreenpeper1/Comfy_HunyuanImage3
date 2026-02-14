@@ -5,6 +5,11 @@ Kijai-style explicit block swapping for transformer blocks.
 Moves blocks between GPU and CPU during forward pass to enable
 large generations on limited VRAM.
 
+Uses pre-allocated pinned CPU buffers to eliminate CRT heap fragmentation
+on Windows. Without this, each block.to('cpu') allocates ~2GB via
+_aligned_malloc which the CRT never returns to the OS, causing RSS to
+grow monotonically across generations.
+
 Author: Eric Hiss (GitHub: EricRollei)
 License: Dual License (Non-Commercial and Commercial Use)
 Copyright (c) 2025 Eric Hiss. All rights reserved.
@@ -66,6 +71,13 @@ class BlockSwapManager:
     2. Other blocks are swapped in/out during forward pass
     3. Prefetching loads next block while current one runs
     
+    Memory Management:
+        Pre-allocates pinned CPU buffers for all swappable blocks during
+        setup_initial_placement(). All subsequent GPU<->CPU transfers reuse
+        these buffers - zero new CPU allocations per generation. This prevents
+        Windows CRT heap fragmentation that causes RSS to grow unboundedly.
+        Pinned memory also enables faster async DMA for prefetch transfers.
+    
     Usage:
         config = BlockSwapConfig(blocks_to_swap=10)
         manager = BlockSwapManager(model, config)
@@ -121,6 +133,11 @@ class BlockSwapManager:
         # Check if model uses INT8 quantization (bitsandbytes)
         self._has_int8_layers = self._detect_int8_layers()
         
+        # Pre-allocated pinned CPU buffers to prevent CRT heap fragmentation.
+        # Maps block_idx -> {param_name: pinned_cpu_tensor, ...}
+        # Created by _create_cpu_buffer_store() during setup_initial_placement().
+        self._cpu_param_store: Dict[int, Dict[str, torch.Tensor]] = {}
+        
         logger.info(f"BlockSwapManager initialized: {self.num_blocks} blocks found")
         logger.info(f"  Config: swap={config.blocks_to_swap}, prefetch={config.prefetch_blocks}")
         if self._has_int8_layers:
@@ -145,7 +162,7 @@ class BlockSwapManager:
         bitsandbytes has a bug where block.to(device) does NOT move weight.CB,
         weight.SCB, state.CB, or state.SCB to the target device. This is because:
         
-        1. Module._apply(fn) calls fn(param) → Int8Params.to() which creates a NEW
+        1. Module._apply(fn) calls fn(param) -> Int8Params.to() which creates a NEW
            Int8Params with CB/SCB on the target device, but Module._apply only copies
            param.data (the raw tensor), discarding the new CB/SCB attributes.
         2. Linear8bitLt.to() overrides .to() to handle state.CB/SCB, but this override
@@ -154,7 +171,7 @@ class BlockSwapManager:
         
         The INT8 lifecycle:
         - Before first forward: weight.CB has the compressed buffer, state.CB is None
-        - After first forward: init_8bit_state() moves weight.CB → state.CB, weight.CB = None
+        - After first forward: init_8bit_state() moves weight.CB -> state.CB, weight.CB = None
         - After matmul: weight.data is set to state.CB (they share the same tensor)
         
         This method explicitly moves ALL int8 data to the target device.
@@ -174,12 +191,12 @@ class BlockSwapManager:
                 weight = module.weight
                 if hasattr(weight, 'CB') and weight.CB is not None and weight.CB.device != device:
                     if self.config.debug or not hasattr(self, '_int8_fix_logged'):
-                        logger.info(f"  [INT8 fix] {name}: weight.CB {weight.CB.device} → {device}")
+                        logger.info(f"  [INT8 fix] {name}: weight.CB {weight.CB.device} -> {device}")
                     weight.CB = weight.CB.to(device)
                     fixed_count += 1
                 if hasattr(weight, 'SCB') and weight.SCB is not None and weight.SCB.device != device:
                     if self.config.debug or not hasattr(self, '_int8_fix_logged'):
-                        logger.info(f"  [INT8 fix] {name}: weight.SCB {weight.SCB.device} → {device}")
+                        logger.info(f"  [INT8 fix] {name}: weight.SCB {weight.SCB.device} -> {device}")
                     weight.SCB = weight.SCB.to(device)
                     fixed_count += 1
                 
@@ -188,18 +205,18 @@ class BlockSwapManager:
                     state = module.state
                     if state.CB is not None and state.CB.device != device:
                         if self.config.debug or not hasattr(self, '_int8_fix_logged'):
-                            logger.info(f"  [INT8 fix] {name}: state.CB {state.CB.device} → {device}")
+                            logger.info(f"  [INT8 fix] {name}: state.CB {state.CB.device} -> {device}")
                         state.CB = state.CB.to(device)
                         fixed_count += 1
                     if state.SCB is not None and state.SCB.device != device:
                         if self.config.debug or not hasattr(self, '_int8_fix_logged'):
-                            logger.info(f"  [INT8 fix] {name}: state.SCB {state.SCB.device} → {device}")
+                            logger.info(f"  [INT8 fix] {name}: state.SCB {state.SCB.device} -> {device}")
                         state.SCB = state.SCB.to(device)
                         fixed_count += 1
         
         if fixed_count > 0 and not hasattr(self, '_int8_fix_logged'):
             self._int8_fix_logged = True
-            logger.info(f"  [INT8 fix] Fixed {fixed_count} INT8 tensor(s) for this block → {device}")
+            logger.info(f"  [INT8 fix] Fixed {fixed_count} INT8 tensor(s) for this block -> {device}")
     
     def _find_transformer_blocks(self) -> List[nn.Module]:
         """
@@ -311,6 +328,214 @@ class BlockSwapManager:
         
         return placement, gpu_count, cpu_count
     
+    # ------------------------------------------------------------------
+    # Pinned CPU buffer store - prevents CRT heap fragmentation
+    # ------------------------------------------------------------------
+    
+    def _create_cpu_buffer_store(self) -> None:
+        """Pre-allocate pinned CPU buffers for all swappable blocks.
+        
+        This is THE key fix for Windows CRT heap fragmentation. Without this,
+        each block.to('cpu') allocates ~2GB of new CPU memory via
+        _aligned_malloc. Over 30 diffusion steps x 10 blocks x 2 directions,
+        that's ~1.2TB churned through the CRT heap per generation. The CRT
+        never returns these pages to the OS, so RSS grows monotonically.
+        
+        With pinned buffers:
+        - GPU->CPU: copy into pre-existing buffer - zero new allocations
+        - CPU->GPU: transfer from pinned memory - uses DMA, 2-3x faster
+        - Buffers are reused across all steps of all generations
+        
+        Called at the end of setup_initial_placement() after blocks are on CPU.
+        """
+        if self.config.blocks_to_swap == 0:
+            return
+        
+        swap_start = self.num_blocks - self.config.blocks_to_swap
+        total_bytes = 0
+        pinned_count = 0
+        fallback_count = 0
+        
+        for block_idx in range(swap_start, self.num_blocks):
+            block = self.blocks[block_idx]
+            store: Dict[str, torch.Tensor] = {}
+            
+            # Parameters (weights, biases, etc.)
+            for name, param in block.named_parameters():
+                buf, was_pinned = self._alloc_pinned_buffer(param.data)
+                # Copy current data into the pinned buffer
+                if param.device.type == 'cpu':
+                    buf.copy_(param.data)
+                    # Point param at the pinned buffer immediately so even
+                    # the first CPU->GPU transfer benefits from DMA
+                    param.data = buf
+                store[name] = buf
+                total_bytes += buf.numel() * buf.element_size()
+                if was_pinned:
+                    pinned_count += 1
+                else:
+                    fallback_count += 1
+            
+            # Buffers (registered via register_buffer, e.g. position embeddings)
+            for name, buffer in block.named_buffers():
+                key = f"__buffer__{name}"
+                if key in store:
+                    continue  # Already covered (shouldn't happen, but safety)
+                buf, was_pinned = self._alloc_pinned_buffer(buffer.data)
+                if buffer.device.type == 'cpu':
+                    buf.copy_(buffer.data)
+                    buffer.data = buf
+                store[key] = buf
+                total_bytes += buf.numel() * buf.element_size()
+                if was_pinned:
+                    pinned_count += 1
+                else:
+                    fallback_count += 1
+            
+            # INT8 bitsandbytes state tensors (CB, SCB) - not in named_parameters
+            if self._has_int8_layers:
+                self._create_int8_buffer_store(block, store)
+            
+            self._cpu_param_store[block_idx] = store
+        
+        num_blocks_stored = len(self._cpu_param_store)
+        logger.info(
+            f"Created pinned CPU buffer store: {num_blocks_stored} blocks, "
+            f"{total_bytes / 1024**3:.2f} GB "
+            f"({pinned_count} pinned, {fallback_count} unpinned fallback)"
+        )
+    
+    @staticmethod
+    def _alloc_pinned_buffer(reference_tensor: torch.Tensor) -> tuple:
+        """Allocate a pinned CPU buffer matching the shape/dtype of reference_tensor.
+        
+        Returns:
+            (buffer, was_pinned) - buffer is always on CPU, was_pinned indicates
+            whether pin_memory succeeded.
+        """
+        try:
+            buf = torch.empty(
+                reference_tensor.shape,
+                dtype=reference_tensor.dtype,
+                device='cpu',
+                pin_memory=True,
+            )
+            return buf, True
+        except Exception:
+            # Pinning can fail if CUDA host allocator is exhausted or
+            # if CUDA isn't initialized yet. Fall back to regular CPU.
+            buf = torch.empty(
+                reference_tensor.shape,
+                dtype=reference_tensor.dtype,
+                device='cpu',
+            )
+            return buf, False
+    
+    def _create_int8_buffer_store(self, block: nn.Module, store: Dict[str, torch.Tensor]) -> None:
+        """Create pinned buffers for INT8 bitsandbytes state tensors.
+        
+        INT8 lifecycle:
+        - Before first forward: weight.CB has compressed buffer, state.CB is None
+        - After first forward: init_8bit_state() moves weight.CB -> state.CB
+        - We snapshot whatever exists now; any new tensors that appear later
+          (after init_8bit_state) are handled lazily in _move_int8_to_cpu_buffered.
+        """
+        try:
+            from bitsandbytes.nn import Linear8bitLt
+        except ImportError:
+            return
+        
+        for name, module in block.named_modules():
+            if not isinstance(module, Linear8bitLt):
+                continue
+            
+            weight = module.weight
+            
+            # weight.CB / weight.SCB (exist before first forward)
+            for attr in ('CB', 'SCB'):
+                tensor = getattr(weight, attr, None)
+                if tensor is None:
+                    continue
+                key = f"__int8__{name}__weight_{attr}"
+                buf, _ = self._alloc_pinned_buffer(tensor)
+                if tensor.device.type == 'cpu':
+                    buf.copy_(tensor)
+                    setattr(weight, attr, buf)
+                store[key] = buf
+            
+            # state.CB / state.SCB (exist after first forward)
+            if hasattr(module, 'state'):
+                state = module.state
+                for attr in ('CB', 'SCB'):
+                    tensor = getattr(state, attr, None)
+                    if tensor is None:
+                        continue
+                    key = f"__int8__{name}__state_{attr}"
+                    buf, _ = self._alloc_pinned_buffer(tensor)
+                    if tensor.device.type == 'cpu':
+                        buf.copy_(tensor)
+                        setattr(state, attr, buf)
+                    store[key] = buf
+    
+    def _move_int8_to_cpu_buffered(
+        self,
+        block: nn.Module,
+        store: Dict[str, torch.Tensor],
+        non_blocking: bool,
+    ) -> None:
+        """Move INT8 state tensors into pre-allocated pinned CPU buffers.
+        
+        Lazily creates pinned buffers for tensors that didn't exist at
+        snapshot time (e.g. state.CB after init_8bit_state runs).
+        """
+        try:
+            from bitsandbytes.nn import Linear8bitLt
+        except ImportError:
+            return
+        
+        for name, module in block.named_modules():
+            if not isinstance(module, Linear8bitLt):
+                continue
+            
+            weight = module.weight
+            
+            # weight.CB / weight.SCB
+            for attr in ('CB', 'SCB'):
+                tensor = getattr(weight, attr, None)
+                if tensor is None or tensor.device.type == 'cpu':
+                    continue
+                key = f"__int8__{name}__weight_{attr}"
+                if key in store:
+                    store[key].copy_(tensor, non_blocking=non_blocking)
+                    setattr(weight, attr, store[key])
+                else:
+                    # Lazy creation for tensors that appeared after snapshot
+                    buf, _ = self._alloc_pinned_buffer(tensor)
+                    buf.copy_(tensor, non_blocking=non_blocking)
+                    store[key] = buf
+                    setattr(weight, attr, buf)
+            
+            # state.CB / state.SCB
+            if hasattr(module, 'state'):
+                state = module.state
+                for attr in ('CB', 'SCB'):
+                    tensor = getattr(state, attr, None)
+                    if tensor is None or tensor.device.type == 'cpu':
+                        continue
+                    key = f"__int8__{name}__state_{attr}"
+                    if key in store:
+                        store[key].copy_(tensor, non_blocking=non_blocking)
+                        setattr(state, attr, store[key])
+                    else:
+                        buf, _ = self._alloc_pinned_buffer(tensor)
+                        buf.copy_(tensor, non_blocking=non_blocking)
+                        store[key] = buf
+                        setattr(state, attr, buf)
+    
+    # ------------------------------------------------------------------
+    # Initial placement
+    # ------------------------------------------------------------------
+    
     def setup_initial_placement(self) -> None:
         """
         Set up initial block placement based on config.
@@ -320,6 +545,9 @@ class BlockSwapManager:
         
         Blocks 0 to (num_blocks - blocks_to_swap - 1) stay on GPU.
         Remaining blocks start on CPU/offload device.
+        
+        After placement, creates pre-allocated pinned CPU buffers for all
+        swappable blocks to prevent CRT heap fragmentation during generation.
         """
         if not self.blocks:
             logger.warning("No blocks to set up")
@@ -356,18 +584,19 @@ class BlockSwapManager:
         
         for i, block in enumerate(self.blocks):
             if i < swap_start:
-                # Keep on GPU — move there if not already
+                # Keep on GPU -- move there if not already
                 current = actual_placement.get(i)
                 if current != self.target_device:
                     # Block is on CPU/other device (e.g., INT8/BF16 loaded with device_map="cpu")
                     # Must actively move to GPU
-                    self._move_block_to_device(i, self.target_device, non_blocking=False)
+                    self._move_block_to_device_raw(i, self.target_device, non_blocking=False)
                 else:
                     self.block_locations[i] = self.target_device
                 gpu_blocks += 1
             else:
-                # Move to offload device
-                self._move_block_to_device(i, self.offload_device)
+                # Move to offload device (uses raw path since buffer store
+                # doesn't exist yet)
+                self._move_block_to_device_raw(i, self.offload_device)
                 cpu_blocks += 1
         
         self.stats.blocks_currently_on_gpu = gpu_blocks
@@ -376,6 +605,25 @@ class BlockSwapManager:
         # Initialize CUDA stream for prefetching
         if self.config.prefetch_blocks > 0 and self.target_device.type == "cuda":
             self._prefetch_stream = torch.cuda.Stream(device=self.target_device)
+        
+        # === Create pinned CPU buffer store ===
+        # This MUST happen after blocks are moved to their initial devices
+        # so we can snapshot the CPU tensors and swap param.data to pinned.
+        self._create_cpu_buffer_store()
+        
+        # === Flush CUDA caching allocator ===
+        # During initial placement, blocks were moved GPU<->CPU which causes
+        # PyTorch's CUDA caching allocator to hoard freed GPU memory. Without
+        # this flush, the allocator can hold 70-80GB of "reserved but unused"
+        # VRAM, leaving no room for inference activations (OOM on first step).
+        if self.target_device.type == "cuda":
+            before_reserved = torch.cuda.memory_reserved(self.target_device) / 1024**3
+            torch.cuda.empty_cache()
+            after_reserved = torch.cuda.memory_reserved(self.target_device) / 1024**3
+            freed = before_reserved - after_reserved
+            if freed > 0.1:
+                logger.info(f"  Flushed CUDA cache: reclaimed {freed:.1f}GB VRAM "
+                           f"(reserved: {before_reserved:.1f}GB -> {after_reserved:.1f}GB)")
         
         # Calculate memory savings
         if cpu_blocks > 0:
@@ -386,6 +634,58 @@ class BlockSwapManager:
             logger.info(f"  Blocks on {self.offload_device}: {cpu_blocks} (indices {swap_start}-{self.num_blocks-1})")
             logger.info(f"  Estimated VRAM saved: {saved_gb:.2f} GB")
     
+    # ------------------------------------------------------------------
+    # Block movement
+    # ------------------------------------------------------------------
+    
+    def _move_block_to_device_raw(
+        self,
+        block_idx: int,
+        device: torch.device,
+        non_blocking: bool = None,
+    ) -> float:
+        """Move a block using standard block.to() - no buffer store.
+        
+        Used during initial placement (before buffer store exists) and as
+        fallback when a block has no buffer store entry.
+        """
+        if block_idx >= len(self.blocks):
+            return 0.0
+        
+        block = self.blocks[block_idx]
+        current_device = self.block_locations.get(block_idx)
+        if current_device == device:
+            return 0.0
+        
+        if non_blocking is None:
+            non_blocking = self.config.use_non_blocking
+        
+        start_time = time.time()
+        
+        block.to(device, non_blocking=non_blocking)
+        self._fix_int8_state_devices(block, device)
+        
+        if not non_blocking and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        
+        elapsed = time.time() - start_time
+        self.block_locations[block_idx] = device
+        self.stats.total_swap_time_seconds += elapsed
+        
+        if device == self.target_device:
+            self.stats.total_swaps_to_gpu += 1
+            self.stats.blocks_currently_on_gpu += 1
+            self.stats.blocks_currently_on_cpu -= 1
+        else:
+            self.stats.total_swaps_to_cpu += 1
+            self.stats.blocks_currently_on_gpu -= 1
+            self.stats.blocks_currently_on_cpu += 1
+        
+        if self.config.debug:
+            logger.debug(f"Block {block_idx} moved to {device} in {elapsed*1000:.1f}ms (raw)")
+        
+        return elapsed
+    
     def _move_block_to_device(
         self,
         block_idx: int,
@@ -393,7 +693,13 @@ class BlockSwapManager:
         non_blocking: bool = None
     ) -> float:
         """
-        Move a block to specified device.
+        Move a block to specified device, using pinned buffer store when available.
+        
+        GPU->CPU path: copies parameter data into pre-allocated pinned CPU buffers.
+                       Zero new CPU allocations - prevents CRT heap fragmentation.
+        CPU->GPU path: transfers from pinned buffers via DMA (2-3x faster than
+                       pageable memory).
+        Fallback:      standard block.to() if no buffer store for this block.
         
         Args:
             block_idx: Index of block to move
@@ -416,16 +722,51 @@ class BlockSwapManager:
         if non_blocking is None:
             non_blocking = self.config.use_non_blocking
         
+        store = self._cpu_param_store.get(block_idx)
+        
+        if store is None:
+            # No buffer store - fall back to raw block.to()
+            return self._move_block_to_device_raw(block_idx, device, non_blocking)
+        
         start_time = time.time()
         
-        # Move all parameters and buffers
-        block.to(device, non_blocking=non_blocking)
+        if device.type == 'cpu' or device == self.offload_device:
+            # === BUFFERED GPU->CPU ===
+            # Copy each tensor into its pre-allocated pinned buffer, then
+            # point the param/buffer at the pinned tensor. The old GPU tensor
+            # is released back to the CUDA caching allocator.
+            for name, param in block.named_parameters():
+                if name in store and param.data.device != device:
+                    store[name].copy_(param.data, non_blocking=non_blocking)
+                    param.data = store[name]
+            
+            for name, buf in block.named_buffers():
+                key = f"__buffer__{name}"
+                if key in store and buf.data.device != device:
+                    store[key].copy_(buf.data, non_blocking=non_blocking)
+                    buf.data = store[key]
+            
+            if self._has_int8_layers:
+                self._move_int8_to_cpu_buffered(block, store, non_blocking)
         
-        # Fix INT8 bitsandbytes state tensors that block.to() missed
-        # (Module._apply doesn't call Linear8bitLt.to() on children)
-        self._fix_int8_state_devices(block, device)
+        else:
+            # === BUFFERED CPU->GPU ===
+            # Transfer from pinned CPU buffers via DMA. Each param.data already
+            # points to a pinned buffer (set during _create_cpu_buffer_store or
+            # previous GPU->CPU move), so .to(cuda, non_blocking=True) uses
+            # the fast cudaMemcpyAsync pinned path.
+            for name, param in block.named_parameters():
+                if param.data.device != device:
+                    param.data = param.data.to(device, non_blocking=non_blocking)
+            
+            for name, buf in block.named_buffers():
+                if buf.data.device != device:
+                    buf.data = buf.data.to(device, non_blocking=non_blocking)
+            
+            if self._has_int8_layers:
+                self._fix_int8_state_devices(block, device)
         
-        # Sync if blocking transfer
+        # Sync if blocking transfer to GPU
         if not non_blocking and device.type == "cuda":
             torch.cuda.synchronize(device)
         
@@ -445,9 +786,13 @@ class BlockSwapManager:
             self.stats.blocks_currently_on_cpu += 1
         
         if self.config.debug:
-            logger.debug(f"Block {block_idx} moved to {device} in {elapsed*1000:.1f}ms")
+            logger.debug(f"Block {block_idx} moved to {device} in {elapsed*1000:.1f}ms (buffered)")
         
         return elapsed
+    
+    # ------------------------------------------------------------------
+    # Prepare / release / prefetch
+    # ------------------------------------------------------------------
     
     def prepare_block(self, block_idx: int) -> None:
         """
@@ -521,7 +866,10 @@ class BlockSwapManager:
     
     def _prefetch_upcoming(self, current_idx: int) -> None:
         """
-        Prefetch upcoming blocks asynchronously.
+        Prefetch upcoming blocks asynchronously using pinned buffers.
+        
+        When buffer store is available, uses param-level .to() from pinned
+        memory which enables true async DMA via cudaMemcpyAsync.
         
         Args:
             current_idx: Currently executing block index
@@ -548,12 +896,26 @@ class BlockSwapManager:
                 continue
             
             # Async prefetch
+            block = self.blocks[prefetch_idx]
+            store = self._cpu_param_store.get(prefetch_idx)
+            
             with torch.cuda.stream(self._prefetch_stream):
-                block = self.blocks[prefetch_idx]
-                block.to(self.target_device, non_blocking=True)
-                
-                # Fix INT8 state tensors that block.to() missed
-                self._fix_int8_state_devices(block, self.target_device)
+                if store is not None:
+                    # Param-level transfers from pinned buffers (fast DMA)
+                    for name, param in block.named_parameters():
+                        if param.data.device != self.target_device:
+                            param.data = param.data.to(self.target_device, non_blocking=True)
+                    
+                    for name, buf in block.named_buffers():
+                        if buf.data.device != self.target_device:
+                            buf.data = buf.data.to(self.target_device, non_blocking=True)
+                    
+                    if self._has_int8_layers:
+                        self._fix_int8_state_devices(block, self.target_device)
+                else:
+                    # Fallback: standard block.to()
+                    block.to(self.target_device, non_blocking=True)
+                    self._fix_int8_state_devices(block, self.target_device)
                 
                 # Record event for synchronization
                 event = torch.cuda.Event()
@@ -565,6 +927,10 @@ class BlockSwapManager:
             
             if self.config.debug:
                 logger.debug(f"Prefetching block {prefetch_idx}")
+    
+    # ------------------------------------------------------------------
+    # Hook installation / removal
+    # ------------------------------------------------------------------
     
     def install_hooks(self) -> bool:
         """
@@ -738,7 +1104,7 @@ class BlockSwapManager:
                 if fixed and not _guard_logged[0]:
                     _guard_logged[0] = True
                     logger.warning(f"  [INT8 guard] Fixed device mismatch in {layer_name} "
-                                 f"→ moved to {target} (bitsandbytes .to() workaround)")
+                                 f"-> moved to {target} (bitsandbytes .to() workaround)")
             return hook
         
         for block_idx, block in enumerate(self.blocks):
@@ -772,10 +1138,79 @@ class BlockSwapManager:
         
         return removed
     
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+    
+    def cleanup(self) -> None:
+        """
+        Full cleanup: remove hooks, release buffers, break circular references.
+        
+        MUST be called before deleting the model to prevent RAM leaks.
+        Without this, the circular reference chain:
+            model -> _block_swap_manager -> model (via self.model)
+            model -> _block_swap_manager -> blocks[] -> model.model.layers[i]
+        keeps all transformer block tensors alive in RAM even after
+        `del model`, because Python's gc can't always collect cycles
+        involving C-extension objects (torch tensors, bitsandbytes Int8Params).
+        
+        This method:
+        1. Removes all forward hooks
+        2. Releases pinned CPU buffer store (frees pinned memory)
+        3. Clears the blocks list (drops refs to model.model.layers[i])
+        4. Clears CUDA streams and prefetch events
+        5. Nulls the model reference (breaks the circular ref)
+        6. Clears block location tracking
+        """
+        # Step 1: Remove hooks first (they hold closures referencing self)
+        if self._hooks_installed:
+            self.remove_hooks()
+        
+        # Step 2: Release pinned CPU buffer store
+        # Each buffer is a pinned tensor - clearing the dict releases the
+        # pinned memory back to the CUDA host allocator.
+        if self._cpu_param_store:
+            num_buffers = sum(len(s) for s in self._cpu_param_store.values())
+            total_bytes = sum(
+                buf.numel() * buf.element_size()
+                for store in self._cpu_param_store.values()
+                for buf in store.values()
+            )
+            self._cpu_param_store.clear()
+            logger.info(f"  Released pinned CPU buffer store: "
+                        f"{num_buffers} buffers, {total_bytes / 1024**3:.2f} GB")
+        
+        # Step 3: Clear block references (these hold the actual layer tensors in RAM)
+        num_blocks = len(self.blocks)
+        self.blocks.clear() if isinstance(self.blocks, list) else None
+        self.blocks = []
+        
+        # Step 4: Clear CUDA streams and prefetch events
+        if self._prefetch_events:
+            for event in self._prefetch_events.values():
+                try:
+                    event.synchronize()
+                except Exception:
+                    pass
+            self._prefetch_events.clear()
+        self._prefetch_stream = None
+        
+        # Step 5: Clear block location tracking
+        self.block_locations.clear()
+        
+        # Step 6: Null the model reference (breaks the circular ref)
+        self.model = None
+        
+        logger.info(f"BlockSwapManager cleanup complete: released refs to {num_blocks} blocks")
+    
     @property
     def hooks_installed(self) -> bool:
         """Check if hooks are currently installed."""
         return self._hooks_installed
+    
+    # ------------------------------------------------------------------
+    # Bulk move utilities
+    # ------------------------------------------------------------------
     
     def move_all_to_gpu(self) -> float:
         """
@@ -818,6 +1253,10 @@ class BlockSwapManager:
         logger.info(f"All {self.num_blocks} blocks moved to {self.offload_device} in {total_time:.2f}s")
         return total_time
     
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+    
     def get_memory_summary(self) -> Dict:
         """Get memory usage summary."""
         if not self.blocks:
@@ -825,6 +1264,12 @@ class BlockSwapManager:
         
         gpu_blocks = sum(1 for loc in self.block_locations.values() if loc == self.target_device)
         cpu_blocks = self.num_blocks - gpu_blocks
+        
+        pinned_bytes = sum(
+            buf.numel() * buf.element_size()
+            for store in self._cpu_param_store.values()
+            for buf in store.values()
+        ) if self._cpu_param_store else 0
         
         return {
             "total_blocks": self.num_blocks,
@@ -834,6 +1279,7 @@ class BlockSwapManager:
             "gb_per_block": self.gb_per_block,
             "gpu_memory_gb": gpu_blocks * self.gb_per_block,
             "cpu_memory_gb": cpu_blocks * self.gb_per_block,
+            "pinned_buffer_gb": pinned_bytes / 1024**3,
             "hooks_installed": self._hooks_installed,
             "stats": str(self.stats),
         }

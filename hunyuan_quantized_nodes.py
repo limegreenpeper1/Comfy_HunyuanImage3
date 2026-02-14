@@ -43,6 +43,7 @@ from .hunyuan_shared import (
     HunyuanImage3ForceUnload,
     HunyuanImage3SoftUnload,
     HunyuanImage3ClearDownstream,
+    HunyuanRAMDiagnostic,
     HunyuanModelCache,
     MemoryTracker,
     ensure_model_on_device,
@@ -51,8 +52,10 @@ from .hunyuan_shared import (
     get_hunyuan_search_paths,
     patch_dynamic_cache_dtype,
     patch_hunyuan_generate_image,
+    patch_static_cache_lazy_init,
     resolve_hunyuan_model_path,
 )
+from .hunyuan_block_swap import BlockSwapConfig, BlockSwapManager
 from .hunyuan_api_config import get_api_config
 
 logging.basicConfig(level=logging.INFO)
@@ -524,6 +527,7 @@ class HunyuanImage3QuantizedLoader:
     def _apply_dtype_patches(cls):
         logger.info("Applying dtype compatibility patches...")
         patch_dynamic_cache_dtype()
+        patch_static_cache_lazy_init()
 
 
 class HunyuanImage3Int8Loader:
@@ -838,10 +842,26 @@ class HunyuanImage3Int8Loader:
     def _apply_dtype_patches(cls):
         logger.info("Applying dtype compatibility patches...")
         patch_dynamic_cache_dtype()
+        patch_static_cache_lazy_init()
 
 
 class HunyuanImage3NF4LoaderLowVRAMBudget:
-    """NF4 loader variant with explicit GPU budget controls for 24-32GB cards."""
+    """NF4 loader variant with explicit GPU budget controls for 24-32GB cards.
+
+    Supports two loading strategies:
+
+    **Block Swap mode** (``blocks_to_swap > 0``, **recommended for 24 GB GPUs**):
+        Loads the NF4 model to a single device without accelerate hooks, then
+        uses :class:`BlockSwapManager` to keep only N transformer blocks on GPU
+        at any time.  The remaining blocks reside in CPU RAM and are swapped in
+        on-the-fly during the forward pass.  This is the same proven approach
+        used by the V2 Unified node and the Instruct nodes.
+
+    **Legacy mode** (``blocks_to_swap == 0``):
+        Uses ``infer_auto_device_map`` to force all 32 transformer blocks to
+        GPU 0.  This requires ~24 GB and may OOM on 24 GB cards when inference
+        overhead is added.  Kept for backward compatibility.
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -849,19 +869,39 @@ class HunyuanImage3NF4LoaderLowVRAMBudget:
             "required": {
                 "model_name": (cls._get_available_models(),),
                 "force_reload": ("BOOLEAN", {"default": False}),
+                "blocks_to_swap": ("INT", {
+                    "default": 20,
+                    "min": 0,
+                    "max": 32,
+                    "step": 1,
+                    "tooltip": (
+                        "Number of transformer blocks to keep on CPU and swap "
+                        "to GPU during inference. 20 is a good default for 24GB "
+                        "GPUs (keeps ~12 blocks on GPU). Set 0 to disable block "
+                        "swap and use the legacy device_map loading path."
+                    ),
+                }),
                 "reserve_memory_gb": ("FLOAT", {
                     "default": 6.0,
                     "min": 2.0,
                     "max": 20.0,
                     "step": 0.5,
-                    "tooltip": "Fallback headroom if GPU budget <= 0. Leave ≥6GB so auto mode keeps inference breathing room."
+                    "tooltip": (
+                        "VRAM headroom reserved for inference activations (GB). "
+                        "Only used in legacy mode (blocks_to_swap=0). "
+                        "Leave ≥6GB so auto mode keeps inference breathing room."
+                    ),
                 }),
                 "gpu_memory_target_gb": ("FLOAT", {
                     "default": 18.0,
                     "min": 4.0,
                     "max": 128.0,
                     "step": 0.5,
-                    "tooltip": "Approximate GPU budget for NF4 weights (GB). 18‑20GB for 24GB GPUs, 26‑28GB for 32GB GPUs."
+                    "tooltip": (
+                        "Approximate GPU budget for NF4 weights (GB). "
+                        "Only used in legacy mode (blocks_to_swap=0). "
+                        "18-20GB for 24GB GPUs, 26-28GB for 32GB GPUs."
+                    ),
                 }),
             },
             "optional": {
@@ -889,7 +929,7 @@ class HunyuanImage3NF4LoaderLowVRAMBudget:
         return available
 
     def load_model(self, model_name, force_reload=False, unload_signal=None,
-                  reserve_memory_gb=6.0, gpu_memory_target_gb=18.0):
+                  blocks_to_swap=20, reserve_memory_gb=6.0, gpu_memory_target_gb=18.0):
         model_path = Path(resolve_hunyuan_model_path(model_name))
         model_path_str = str(model_path)
 
@@ -934,13 +974,204 @@ class HunyuanImage3NF4LoaderLowVRAMBudget:
                         logger.info("✓ Using cached NF4 Low VRAM model (validated CUDA params present)")
                         self._apply_dtype_patches()
                         patch_hunyuan_generate_image(cached)
-                        ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=True)
+
+                        # Update block swap config if blocks_to_swap changed
+                        bsm = getattr(cached, '_block_swap_manager', None)
+                        if bsm is not None:
+                            if bsm.hooks_installed:
+                                bsm.remove_hooks()
+                            bsm.config.blocks_to_swap = blocks_to_swap
+                            bsm.setup_initial_placement()
+                            if blocks_to_swap > 0:
+                                bsm.install_hooks()
+                                logger.info(f"Block swap updated: swapping {blocks_to_swap}/{bsm.num_blocks} blocks")
+                        else:
+                            ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=True)
                         return (cached,)
             except Exception as e:
                 logger.warning(f"Failed to validate cached model: {e}. Clearing cache and reloading...")
                 HunyuanModelCache.clear()
                 cached = None
 
+        # --- Dispatch to block-swap or legacy loading path ---
+        if blocks_to_swap > 0:
+            return self._load_block_swap(model_path_str, model_name, blocks_to_swap)
+        else:
+            return self._load_legacy(model_path_str, model_name,
+                                     reserve_memory_gb, gpu_memory_target_gb)
+
+    # ------------------------------------------------------------------
+    # Block-swap loading (recommended for 24 GB GPUs)
+    # ------------------------------------------------------------------
+
+    def _load_block_swap(self, model_path_str, model_name, blocks_to_swap):
+        """Load NF4 model with direct placement + BlockSwapManager.
+
+        Uses ``device_map={"": device}`` so that bitsandbytes quantises
+        directly to a single GPU without accelerate hooks.  After loading,
+        :class:`BlockSwapManager` moves ``blocks_to_swap`` transformer blocks
+        to CPU, freeing VRAM for inference activations.
+
+        This is the same proven approach used by the V2 Unified node and the
+        Instruct nodes.
+        """
+        import gc
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            gc.collect()
+            free_vram, total_vram = torch.cuda.mem_get_info(0)
+            logger.info(
+                f"VRAM before load: {(total_vram - free_vram) / 1024**3:.2f}GB used / "
+                f"{total_vram / 1024**3:.2f}GB total ({free_vram / 1024**3:.2f}GB free)"
+            )
+
+        logger.info("=" * 60)
+        logger.info(f"Loading {model_name} (NF4 Block-Swap Mode)")
+        logger.info(f"  blocks_to_swap={blocks_to_swap}  →  "
+                     f"{32 - blocks_to_swap} blocks kept on GPU, "
+                     f"{blocks_to_swap} blocks on CPU")
+        logger.info("=" * 60)
+
+        skip_modules = [
+            "vae", "model.vae", "vae.decoder", "vae.encoder",
+            "autoencoder", "model.autoencoder", "autoencoder.decoder", "autoencoder.encoder",
+            "patch_embed", "model.patch_embed",
+            "final_layer", "model.final_layer",
+            "time_embed", "model.time_embed", "time_embed_2", "model.time_embed_2",
+            "timestep_emb", "model.timestep_emb",
+            "attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.o_proj",
+            "attn.qkv_proj", "attn.out_proj",
+            "self_attn", "cross_attn",
+            "norm", "model.norm",
+            "lm_head", "model.lm_head",
+            "embed_tokens", "model.embed_tokens",
+        ]
+
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            modules_to_not_convert=skip_modules,
+            llm_int8_skip_modules=skip_modules,
+        )
+
+        model = None
+        try:
+            # Direct placement — no accelerate hooks, no device_map="auto"
+            load_kwargs = dict(
+                quantization_config=quant_config,
+                device_map={"": device},
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+                moe_impl="eager",
+                moe_drop_tokens=True,
+                low_cpu_mem_usage=True,
+            )
+            try:
+                model = AutoModelForCausalLM.from_pretrained(model_path_str, **load_kwargs)
+            except TypeError as exc:
+                logger.warning("Falling back to legacy load args due to: %s", exc)
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_path_str,
+                    quantization_config=quant_config,
+                    device_map={"": device},
+                    trust_remote_code=True,
+                    torch_dtype=torch.bfloat16,
+                    low_cpu_mem_usage=True,
+                )
+
+            # Tokenizer
+            logger.info("Loading tokenizer...")
+            model.load_tokenizer(model_path_str)
+
+            # Patches
+            self._apply_dtype_patches()
+            patch_hunyuan_generate_image(model)
+
+            # Remove stale hf_device_map so generators don't detect it
+            if hasattr(model, "hf_device_map"):
+                delattr(model, "hf_device_map")
+
+            # Remove any accelerate dispatch hooks (device_map={"": ...}
+            # shouldn't create them, but belt-and-suspenders)
+            try:
+                from accelerate.hooks import remove_hook_from_module
+                for _name, module in model.named_modules():
+                    if hasattr(module, "_hf_hook"):
+                        remove_hook_from_module(module)
+            except (ImportError, Exception):
+                pass
+
+            # Ensure VAE in full precision on GPU
+            if hasattr(model, "vae"):
+                target_device = torch.device(device)
+                model.vae = model.vae.to(device=target_device, dtype=torch.bfloat16)
+                logger.info("✓ VAE configured in full precision on %s", target_device)
+
+            # --- Block Swap Manager ---
+            config = BlockSwapConfig(
+                blocks_to_swap=blocks_to_swap,
+                prefetch_blocks=2,
+                use_non_blocking=True,
+            )
+            bsm = BlockSwapManager(model, config, target_device=device)
+            bsm.setup_initial_placement()
+
+            if blocks_to_swap > 0:
+                bsm.install_hooks()
+                gpu_blocks = bsm.stats.blocks_currently_on_gpu
+                cpu_blocks = bsm.stats.blocks_currently_on_cpu
+                logger.info(
+                    f"✓ Block swap enabled: {gpu_blocks} blocks on GPU, "
+                    f"{cpu_blocks} blocks on CPU"
+                )
+            else:
+                logger.info(f"Block swap disabled — all {bsm.num_blocks} blocks on GPU")
+
+            # Attach to model so the generator can find it
+            model._block_swap_manager = bsm
+            model._is_block_swap = True
+
+            # Cache
+            HunyuanModelCache.store(model_path_str, model)
+
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated(0) / 1024**3
+                free_after, _ = torch.cuda.mem_get_info(0)
+                logger.info("✓ NF4 model loaded (block-swap mode)")
+                logger.info(f"  VRAM: Allocated {allocated:.2f}GB, Free {free_after / 1024**3:.2f}GB")
+
+            return (model,)
+
+        except Exception as e:
+            logger.error("Failed to load NF4 model (block-swap): %s", e)
+            if model is not None:
+                try:
+                    del model
+                except Exception:
+                    pass
+            HunyuanModelCache.clear()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            raise
+
+    # ------------------------------------------------------------------
+    # Legacy loading (device_map with forced GPU placement)
+    # ------------------------------------------------------------------
+
+    def _load_legacy(self, model_path_str, model_name,
+                     reserve_memory_gb, gpu_memory_target_gb):
+        """Original loading path using infer_auto_device_map.
+
+        Forces all 32 transformer blocks to GPU 0.  This fills the entire GPU
+        and may OOM on 24 GB cards when inference activations are added.
+        Kept for backward compatibility — users should prefer block-swap mode.
+        """
         max_memory = None
         target_gpu_gb = None
         total_vram_gb = None
@@ -950,8 +1181,8 @@ class HunyuanImage3NF4LoaderLowVRAMBudget:
             free_vram, total_vram = torch.cuda.mem_get_info(0)
             total_vram_gb = total_vram / 1024**3
             logger.info(
-                f"VRAM before load: {(total_vram-free_vram)/1024**3:.2f}GB used / {total_vram/1024**3:.2f}GB total"
-                f" ({free_vram/1024**3:.2f}GB free)"
+                f"VRAM before load: {(total_vram - free_vram) / 1024**3:.2f}GB used / "
+                f"{total_vram / 1024**3:.2f}GB total ({free_vram / 1024**3:.2f}GB free)"
             )
 
             if gpu_memory_target_gb and gpu_memory_target_gb > 0:
@@ -1171,6 +1402,7 @@ class HunyuanImage3NF4LoaderLowVRAMBudget:
     def _apply_dtype_patches(cls):
         logger.info("Applying dtype compatibility patches...")
         patch_dynamic_cache_dtype()
+        patch_static_cache_lazy_init()
 
 
 class HunyuanImage3Int8LoaderBudget:
@@ -1452,6 +1684,7 @@ class HunyuanImage3Int8LoaderBudget:
     def _apply_dtype_patches(cls):
         logger.info("Applying dtype compatibility patches...")
         patch_dynamic_cache_dtype()
+        patch_static_cache_lazy_init()
 
 
 class HunyuanImage3Generate:
@@ -1641,6 +1874,10 @@ class HunyuanImage3Generate:
         
         try:
             image = model.generate_image(**gen_kwargs)
+        except torch.cuda.OutOfMemoryError:
+            logger.error("CUDA out of memory during generation!")
+            logger.error("  Try: use GenerateLarge node, lower resolution, or increase blocks_to_swap")
+            raise
         finally:
             # Restore original method if we patched it
             if hasattr(self, "_model_to_restore"):
@@ -2217,7 +2454,7 @@ class HunyuanImage3GenerateLarge:
             def new_get_target_size(w, h):
                 # If exact match exists in buckets, use it (preserves standard behavior)
                 key = (int(round(h)), int(round(w)))
-                if key in reso_group._lookup:
+                if hasattr(reso_group, '_lookup') and key in reso_group._lookup:
                     return reso_group._lookup[key].w, reso_group._lookup[key].h
                 # Otherwise return exact requested size
                 # This allows 4K etc. to pass through without being snapped to 1K
@@ -2329,20 +2566,26 @@ class HunyuanImage3GenerateLowVRAM(HunyuanImage3GenerateLarge):
         logger.info("LOW VRAM GENERATION MODE (NF4/INT8 Optimized)")
         logger.info("=" * 60)
 
-        # Check if model is managed by accelerate (common for NF4/INT8)
-        is_accelerate_mapped = hasattr(model, "hf_device_map")
-        if is_accelerate_mapped:
-            logger.info("✓ Detected Accelerate/Quantized model (hf_device_map present)")
-            logger.info("  Skipping manual CPU offload to avoid conflicts with device_map.")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        else:
-            logger.info("! Model does not appear to be quantized/mapped. Using standard Large logic.")
-
-        original_offload_mode = offload_mode
-        if is_accelerate_mapped:
+        # --- Block-swap path (new, preferred) ---
+        bsm = getattr(model, '_block_swap_manager', None)
+        if bsm is not None:
+            logger.info("✓ Block-swap model detected (%d blocks, swapping %d)",
+                        bsm.num_blocks, bsm.config.blocks_to_swap)
+            if not bsm.hooks_installed and bsm.config.blocks_to_swap > 0:
+                bsm.install_hooks()
+                logger.info("  Block-swap hooks installed for generation")
             offload_mode = "disabled"
-            logger.info("  Internal offload_mode set to 'disabled' for parent call (handled by device_map)")
+        else:
+            # --- Legacy device_map path ---
+            is_accelerate_mapped = hasattr(model, "hf_device_map")
+            if is_accelerate_mapped:
+                logger.info("✓ Detected Accelerate/Quantized model (hf_device_map present)")
+                logger.info("  Skipping manual CPU offload to avoid conflicts with device_map.")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                offload_mode = "disabled"
+            else:
+                logger.info("! Model does not appear to be quantized/mapped. Using standard Large logic.")
 
         try:
             return super().generate_large(
@@ -2641,7 +2884,7 @@ class HunyuanImage3GenerateLargeBudget(HunyuanImage3GenerateLarge):
 
             def new_get_target_size(w, h):
                 key = (int(round(h)), int(round(w)))
-                if key in reso_group._lookup:
+                if hasattr(reso_group, '_lookup') and key in reso_group._lookup:
                     return reso_group._lookup[key].w, reso_group._lookup[key].h
                 return int(w), int(h)
 
@@ -2696,7 +2939,20 @@ class HunyuanImage3GenerateLargeBudget(HunyuanImage3GenerateLarge):
 
 
 class HunyuanImage3GenerateLowVRAMBudget(HunyuanImage3GenerateLargeBudget):
-    """Low VRAM optimized generator with GPU budget override support."""
+    """Low VRAM optimized generator with GPU budget override support.
+
+    Supports two model types:
+
+    **Block-swap models** (loaded with ``blocks_to_swap > 0``):
+        The model carries a ``_block_swap_manager`` attribute.  Hooks are
+        installed before generation and removed afterwards.  Offload is
+        handled entirely by :class:`BlockSwapManager` — no accelerate
+        hooks or ``cpu_offload`` calls are needed.
+
+    **Legacy device_map models** (loaded with ``blocks_to_swap == 0``):
+        The model has ``hf_device_map`` set by accelerate.  Manual offload
+        is disabled to avoid conflicts.
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -2731,15 +2987,28 @@ class HunyuanImage3GenerateLowVRAMBudget(HunyuanImage3GenerateLargeBudget):
         logger.info("LOW VRAM GENERATION MODE (Budget)")
         logger.info("=" * 60)
 
-        is_accelerate_mapped = hasattr(model, "hf_device_map")
-        if is_accelerate_mapped:
-            logger.info("✓ Detected Accelerate/Quantized model (hf_device_map present)")
-            logger.info("  Skipping manual CPU offload to avoid conflicts with device_map.")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        # --- Block-swap path (new, preferred) ---
+        bsm = getattr(model, '_block_swap_manager', None)
+        if bsm is not None:
+            logger.info("✓ Block-swap model detected (%d blocks, swapping %d)",
+                        bsm.num_blocks, bsm.config.blocks_to_swap)
+            # Ensure hooks are installed for this run
+            if not bsm.hooks_installed and bsm.config.blocks_to_swap > 0:
+                bsm.install_hooks()
+                logger.info("  Block-swap hooks installed for generation")
+            # No accelerate offload needed — block swap handles everything
             offload_mode = "disabled"
         else:
-            logger.info("! Model does not appear to be quantized/mapped. Using standard Large logic.")
+            # --- Legacy device_map path ---
+            is_accelerate_mapped = hasattr(model, "hf_device_map")
+            if is_accelerate_mapped:
+                logger.info("✓ Detected Accelerate/Quantized model (hf_device_map present)")
+                logger.info("  Skipping manual CPU offload to avoid conflicts with device_map.")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                offload_mode = "disabled"
+            else:
+                logger.info("! Model does not appear to be quantized/mapped. Using standard Large logic.")
 
         try:
             return super().generate_large(
@@ -2775,6 +3044,7 @@ NODE_CLASS_MAPPINGS = {
     "HunyuanImage3SoftUnload": HunyuanImage3SoftUnload,
     "HunyuanImage3ForceUnload": HunyuanImage3ForceUnload,
     "HunyuanImage3ClearDownstream": HunyuanImage3ClearDownstream,
+    "HunyuanRAMDiagnostic": HunyuanRAMDiagnostic,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2792,4 +3062,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HunyuanImage3SoftUnload": "Hunyuan 3 Soft Unload (Fast)",
     "HunyuanImage3ForceUnload": "Hunyuan 3 Force Unload (Nuclear)",
     "HunyuanImage3ClearDownstream": "Hunyuan 3 Clear Downstream Models",
+    "HunyuanRAMDiagnostic": "Hunyuan 3 RAM Diagnostic",
 }

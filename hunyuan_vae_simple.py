@@ -140,6 +140,17 @@ class SimpleVAEManager:
         logger.info(f"VAE moved back to CPU in {elapsed:.2f}s")
         return elapsed
     
+    def cleanup(self) -> None:
+        """
+        Break reference to the model to allow garbage collection.
+        
+        Without this, vae_manager.model holds a strong ref to the entire
+        ~150GB model, preventing gc even after the cache drops its ref.
+        """
+        self.model = None
+        self._vae_on_gpu = False
+        logger.info("SimpleVAEManager cleanup: model reference released")
+    
     def _move_vae_to_gpu(self) -> None:
         """Move VAE to GPU."""
         if not hasattr(self.model, 'vae'):

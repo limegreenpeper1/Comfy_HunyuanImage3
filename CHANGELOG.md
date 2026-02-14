@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2026-02-11
+
+### Added
+- **33 Resolution Presets**: Instruct resolution dropdown now includes all model-native bucket resolutions (~1MP each), ordered tallest portrait (512×2048) → square (1024×1024) → widest landscape (2048×512).
+- **Multi-Image Fusion 5-input support**: Added `image_4` and `image_5` optional inputs (experimental — model officially supports up to 3, pipeline accepts more).
+
+### Fixed
+- **Issue #16 — NF4 Low VRAM OOM**: Two-stage `max_memory` estimation in quantized loader replaces one-shot approach that left no headroom for inference tensors.
+- **Issue #15 — Multi-GPU device mismatch**: Explicit `.to(device)` on `freqs_cis` / `image_pos_id` prevents cross-device errors during block-swap forward pass.
+- **Issue #12 — Transformers 5.x compatibility**: `_lookup` dict guard in block swap, `BitsAndBytesConfig` import path, and `modeling_utils` attribute checks updated for forward compatibility.
+- **Instruct Image Edit / Multi-Fusion**: Added missing `torch.cuda.OutOfMemoryError` handlers with actionable error messages.
+- **Instruct Multi-Fusion**: Applied multi-GPU block-swap device patch (was missing from instruct nodes).
+
+### Changed
+- Instruct Multi-Fusion `fuse()` method refactored: image path conversion uses a loop instead of separate if-blocks for each image.
+- Resolution tooltips updated across all Instruct generate nodes.
+- Multi-Fusion workflow diagram updated for 3+ images with `think_recaption` recommendation.
+
+### Removed
+- Dead `gc` import from `hunyuan_highres_nodes.py`.
+
+### Code Quality
+- `hunyuan_cache_v2.py`: Added `clear_generation_cache()` helper used by all generate nodes for KV cache cleanup.
+- `hunyuan_shared.py`: Centralized `_aggressive_vram_cleanup()` with stale KV-cache detection.
+- `hunyuan_block_swap.py`: `_lookup` guard for INT8 `Module._apply` hook (transformers 5.x).
+- `hunyuan_quantized_nodes.py`: Two-stage `max_memory` with headroom for inference VRAM.
+- `hunyuan_loader_clean.py`: Multi-GPU device-mismatch fix for `freqs_cis` / `image_pos_id`.
+
 ## [1.1.0] - 2026-02-09
 
 ### Added

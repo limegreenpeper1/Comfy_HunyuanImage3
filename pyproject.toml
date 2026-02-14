@@ -1,7 +1,7 @@
 [project]
 name = "hunyuanimage3"
 description = "Professional ComfyUI custom nodes for Tencent's HunyuanImage-3.0 80B multimodal model — text-to-image, Instruct editing, multi-image fusion, block swap, multiple quantization modes (BF16/INT8/NF4), smart memory management, and high-res generation."
-version = "1.1.0"
+version = "1.2.0"
 license = {file = "LICENSE"} 
 # classifiers = [
 #     # For OS-independent nodes (works on all operating systems)

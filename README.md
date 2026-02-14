@@ -6,8 +6,17 @@
 
 Professional ComfyUI custom nodes for [Tencent HunyuanImage-3.0](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0), the powerful 80B parameter native multimodal image generation model.
 
-> **Latest**
->> - 🚀 **NEW: HighRes Efficient generate node** enables 3MP–4K+ generation on 96GB GPUs by replacing the memory-hungry MoE dispatch_mask with a loop-based expert routing that uses ~75× less VRAM. See [High-Resolution Generation](#-high-resolution-generation-highres-efficient) below.> - ✅ **NF4 Low VRAM Loader + Low VRAM Budget generator are verified on 24‑32 GB cards** thanks to the custom device-map strategy that pins every quantized layer on GPU.
+> **Latest — v1.2.0**
+> - 🎨 **Instruct Resolution Overhaul**: All 33 model-native bucket resolutions now available in the dropdown — from 512×2048 (1:4 Tall) through 1024×1024 (1:1 Square) to 2048×512 (4:1 Wide). Ordered tallest portrait → square → widest landscape.
+> - 🔀 **Multi-Image Fusion expanded to 5 inputs**: Image slots 4 and 5 added as experimental inputs (model officially supports 3, but the pipeline accepts more).
+> - 🛡️ **Transformers 5.x compatibility**: All `_lookup` dict guard, `BitsAndBytesConfig` import, and `modeling_utils` attribute checks updated for forward compatibility.
+> - 🐛 **NF4 Low VRAM OOM fix** (Issue #16): Two-stage `max_memory` estimation replaces the one-shot approach that left no headroom for inference.
+> - 🐛 **Multi-GPU device mismatch fix** (Issue #15): Explicit `.to(device)` calls on `freqs_cis` / `image_pos_id` prevent cross-device errors during block-swap.
+> - 🧹 **Code quality pass**: Dead imports removed, missing OOM handlers added to Instruct nodes, multi-GPU block-swap patch applied consistently.
+>
+> **Previous highlights:**
+> - 🚀 **HighRes Efficient generate node** enables 3MP–4K+ generation on 96GB GPUs by replacing the memory-hungry MoE dispatch_mask with a loop-based expert routing that uses ~75× less VRAM. See [High-Resolution Generation](#-high-resolution-generation-highres-efficient) below.
+> - ✅ **NF4 Low VRAM Loader + Low VRAM Budget generator are verified on 24‑32 GB cards** thanks to the custom device-map strategy that pins every quantized layer on GPU.
 > - ✅ **INT8 Budget loader works end-to-end** and a pre-quantized checkpoint is available on Hugging Face: [EricRollei/Hunyuan_Image_3_Int8](https://huggingface.co/EricRollei/Hunyuan_Image_3_Int8) for anyone who wants INT8 quality without running the quantizer locally.
 > - 📸 Added a reference workflow (below) showing the recommended node pair for Low VRAM setups.
 
@@ -32,16 +41,16 @@ Professional ComfyUI custom nodes for [Tencent HunyuanImage-3.0](https://github.
 - **Instruct Model Support** (NEW):
   - Built-in Chain-of-Thought (CoT) prompt enhancement — no external API needed
   - Image-to-Image editing with natural language instructions
-  - Multi-image fusion (combine 2–3 reference images)
+  - Multi-image fusion (combine 2–5 reference images; 4–5 experimental)
   - Block swap for BF16/INT8/NF4 models on 48–96GB GPUs
 - **Advanced Prompting**:
   - Optional prompt enhancement using official HunyuanImage-3.0 system prompts
   - Supports any OpenAI-compatible LLM API (DeepSeek, OpenAI, Claude, local LLMs)
   - Two professional rewriting modes: en_recaption (structured) and en_think_recaption (advanced)
 - **Professional Resolution Control**:
-  - Organized dropdown with portrait/landscape/square labels
-  - Megapixel indicators and size categories
-  - Auto resolution detection based on prompt
+  - All 33 model-native bucket resolutions (~1MP each) in the dropdown
+  - Ordered tallest portrait (512×2048) → square (1024×1024) → widest landscape (2048×512)
+  - Aspect ratio labels and Auto resolution option
 - **Production Ready**: Comprehensive error handling, detailed logging, VRAM monitoring
 
 ## 📦 Installation
@@ -330,7 +339,7 @@ The **HunyuanImage-3.0-Instruct** models extend the base model with powerful new
 - **Built-in prompt enhancement** — no external LLM API needed
 - **Chain-of-Thought (CoT) reasoning** — the model "thinks" about your prompt before generating
 - **Image editing** — modify images with natural language instructions
-- **Multi-image fusion** — combine elements from 2–3 reference images
+- **Multi-image fusion** — combine elements from 2–5 reference images (4–5 experimental)
 
 ### Instruct vs Base Model
 
@@ -350,7 +359,7 @@ The **HunyuanImage-3.0-Instruct** models extend the base model with powerful new
 | **Hunyuan Instruct Loader** | Load any Instruct model variant | Auto-detects BF16/INT8/NF4 and Distil vs Full. Block swap support. |
 | **Hunyuan Instruct Generate** | Text-to-image with Instruct model | Bot task modes (image/recaption/think_recaption). Returns CoT reasoning text. |
 | **Hunyuan Instruct Image Edit** | Edit images with instructions | Takes input image + instruction. "Change the background to sunset." |
-| **Hunyuan Instruct Multi-Image Fusion** | Combine 2–3 reference images | "Place the cat from image 1 into the scene from image 2." |
+| **Hunyuan Instruct Multi-Image Fusion** | Combine 2–5 reference images | "Place the cat from image 1 into the scene from image 2." Images 4–5 are experimental. |
 | **Hunyuan Instruct Unload** | Free memory | Clears cached Instruct model from VRAM and RAM. |
 
 ### Instruct Loader Options
@@ -446,24 +455,28 @@ The `cot_reasoning` output returns the model's thought process (for `recaption` 
 ### Instruct Multi-Image Fusion Workflow
 
 ```
-┌──────────────┐   ┌──────────────┐
-│ Load Image 1 │   │ Load Image 2 │
-└──────┬───────┘   └──────┬───────┘
-       │                  │
-       ▼                  ▼
-┌─────────────────────────────────────┐
-│ Hunyuan Instruct Multi-Image Fusion │
-│  instruction: "Place the cat from   │
-│    image 1 into the scene from      │
-│    image 2"                         │
-│  bot_task: image                    │
-└───────────┬─────────────────────────┘
+┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+│ Load Image 1 │   │ Load Image 2 │   │ Load Image 3 │  (+ optional image_4, image_5)
+└──────┬───────┘   └──────┬───────┘   └──────┬───────┘
+       │                  │                  │
+       ▼                  ▼                  ▼
+┌──────────────────────────────────────────────────────┐
+│ Hunyuan Instruct Multi-Image Fusion                  │
+│  instruction: "Place the cat from image 1 into the   │
+│    scene from image 2 with lighting from image 3"    │
+│  bot_task: think_recaption (recommended)              │
+│  resolution: 1024x1024 (1:1 Square)                  │
+└───────────┬──────────────────────────────────────────┘
             │ IMAGE
             ▼
      ┌──────────────┐
      │ Save Image   │
      └──────────────┘
 ```
+
+> **Note:** The model officially supports up to 3 input images. Slots 4 and 5 are
+> experimental — the pipeline accepts them but they increase VRAM usage significantly
+> and results may vary.
 
 ### Downloading Instruct Models
 
@@ -674,7 +687,7 @@ These generator settings never remap the model by themselves—they only influen
 | **Hunyuan 3 Loader (Full BF16)** | **Hunyuan 3 Generate (HighRes Efficient)** | Memory-efficient MoE for 3MP+ on 96GB GPUs. |
 | **Hunyuan Instruct Loader** | **Hunyuan Instruct Generate** | T2I with CoT reasoning and prompt enhancement. |
 | **Hunyuan Instruct Loader** | **Hunyuan Instruct Image Edit** | Edit images with natural language. |
-| **Hunyuan Instruct Loader** | **Hunyuan Instruct Multi-Image Fusion** | Combine 2–3 reference images. |
+| **Hunyuan Instruct Loader** | **Hunyuan Instruct Multi-Image Fusion** | Combine 2–5 reference images (4–5 experimental). |
 
 > **Do not mix them!** Base model loaders are NOT compatible with Instruct generate nodes (and vice versa). The NF4 Loader with the Large/Offload node will also cause errors because the quantized model cannot be moved to CPU correctly.
 
@@ -939,66 +952,7 @@ To get the maximum speed and avoid unnecessary offloading (which slows down gene
     *   **Auto Mode Safety**: When "Auto" is selected, the node assumes a large resolution (~2.5MP) to be safe. This might trigger offloading even if your actual image is small.
     *   **Specific Mode**: Selecting "1024x1024" tells the node *exactly* how much VRAM is needed, allowing it to skip offload if you have the space.
 
-### LLM Prompt Rewriting (Optional)
 
-**✨ Feature**: Uses official HunyuanImage-3.0 system prompts to professionally expand your prompts for better results.
-
-**⚠️ Note**: Requires a paid LLM API. This feature is optional - you can use the nodes without it.
-
-**Supported APIs** (any OpenAI-compatible endpoint):
-- DeepSeek (default, recommended for cost)
-- OpenAI GPT-4/GPT-3.5
-- Claude (via OpenAI-compatible proxy)
-- Local LLMs (via LM Studio, Ollama with OpenAI API)
-
-**Setup (Secure)**:
-1. Rename `api_config.ini.example` to `api_config.ini` in the custom node folder.
-2. Add your API key to the file:
-   ```ini
-   [API]
-   api_key = sk-your-key-here
-   ```
-3. Alternatively, set environment variables: `HUNYUAN_API_KEY`, `HUNYUAN_API_URL`.
-
-**Usage**:
-- **Option 1 (Integrated)**: Enable `enable_prompt_rewrite` in the Generate node.
-- **Option 2 (Standalone)**: Use the **Hunyuan Prompt Rewriter** node to rewrite prompts before passing them to any model.
-
-```
-┌─────────────────────────┐      ┌─────────────────────────┐
-│ Hunyuan Prompt Rewriter │      │ Hunyuan 3 Generate      │
-│  prompt: "dog running"  │ ───► │  prompt: (rewritten)    │
-│  rewrite_style: ...     │      │  ...                    │
-└─────────────────────────┘      └─────────────────────────┘
-```
-
-**Result**: Automatically expands to:
-> "An energetic brown and white border collie running across a sun-drenched meadow filled with wildflowers, motion blur on legs showing speed, golden hour lighting, shallow depth of field, professional photography, high detail, 8k quality"
-
-**Rewrite Styles** (Official HunyuanImage-3.0 system prompts):
-- **none**: (Default) Use your original prompt without modification
-- **en_recaption**: Structured professional expansion with detailed descriptions (recommended)
-  - Adds objective, physics-consistent details
-  - Enhances lighting, composition, color descriptions
-  - Best for general use
-- **en_think_recaption**: Advanced mode with thinking phase + detailed expansion
-  - LLM analyzes your intent first, then creates detailed prompt
-  - More comprehensive but uses more tokens
-  - Best for complex or ambiguous prompts
-
-**Example Results**:
-```
-Original: "a cat on a table"
-
-en_recaption: "A domestic short-hair cat with orange and white fur sits 
-upright on a wooden dining table. Soft afternoon sunlight streams through 
-a nearby window, casting warm highlights on the cat's fur and creating 
-gentle shadows on the table surface. The background shows a blurred 
-kitchen interior with neutral tones. Ultra-realistic, photographic style, 
-sharp focus on the cat, shallow depth of field, 8k resolution."
-```
-
-If you get a "402 Payment Required" error, add credits to your API account or disable prompt rewriting.
 
 ## 🛠️ Quantization
 
@@ -1156,8 +1110,6 @@ Contributions welcome! Please:
 
 ## 📄 License
 
-## 📄 License
-
 **Dual License** (Non-Commercial and Commercial Use):
 
 1. **Non-Commercial Use**: Licensed under [Creative Commons Attribution-NonCommercial 4.0 International License](http://creativecommons.org/licenses/by-nc/4.0/)
@@ -1167,7 +1119,7 @@ See [LICENSE](LICENSE) for full details.
 
 **Note**: The HunyuanImage-3.0 model itself is licensed under Apache 2.0 by Tencent. This license only covers the ComfyUI integration code.
 
-Copyright (c) 2025 Eric Hiss. All rights reserved.
+Copyright (c) 2025-2026 Eric Hiss. All rights reserved.
 
 ## 🙏 Credits
 
@@ -1195,6 +1147,31 @@ Copyright (c) 2025 Eric Hiss. All rights reserved.
 - **Tencent Official**: [WeChat](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/assets/WECHAT.md) | [Discord](https://discord.gg/ehjWMqF5wY)
 
 ## 🔄 Changelog
+
+### v1.2.0 (2026-02-11)
+
+**Resolution & UX Improvements:**
+- Instruct resolution dropdown expanded to all 33 model-native bucket resolutions (~1MP each), ordered tallest portrait → square → widest landscape
+- Multi-Image Fusion node expanded from 3 to 5 image inputs (slots 4–5 experimental)
+- Resolution tooltips updated across all Instruct generate nodes
+
+**Bug Fixes:**
+- **Issue #16 — NF4 Low VRAM OOM**: Two-stage `max_memory` estimation in quantized loader replaces one-shot approach that left no headroom for inference
+- **Issue #15 — Multi-GPU device mismatch**: Explicit `.to(device)` on `freqs_cis` / `image_pos_id` prevents cross-device errors during block-swap forward pass
+- **Issue #12 — Transformers 5.x compatibility**: `_lookup` dict guard, `BitsAndBytesConfig` import path, and `modeling_utils` attribute checks updated
+
+**Code Quality:**
+- Instruct nodes: added missing multi-GPU block-swap patch, OOM error handlers for Image Edit and Multi-Fusion
+- Removed dead `gc` import from `hunyuan_highres_nodes.py`
+- Cache v2: added `clear_generation_cache()` helper used by all generate nodes
+- Shared utilities: centralized `_aggressive_vram_cleanup()` with stale KV-cache detection
+- Block swap: `_lookup` guard for INT8 `Module._apply` hook (transformers 5.x)
+
+### v1.1.0 (2026-02-09)
+- Instruct model nodes (Loader, Generate, Image Edit, Multi-Fusion, Unload)
+- Block swap, HighRes Efficient node, Unified V2 node
+- Flexible model paths via `extra_model_paths.yaml`
+- Soft Unload, Force Unload, Clear Downstream nodes
 
 ### v1.0.0 (2025-11-17)
 - Initial release

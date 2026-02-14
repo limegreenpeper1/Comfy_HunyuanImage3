@@ -305,7 +305,7 @@ class HunyuanImage3GenerateHighRes:
             
             def new_get_target_size(w, h):
                 key = (int(round(h)), int(round(w)))
-                if key in reso_group._lookup:
+                if hasattr(reso_group, '_lookup') and key in reso_group._lookup:
                     return reso_group._lookup[key].w, reso_group._lookup[key].h
                 return int(w), int(h)
             

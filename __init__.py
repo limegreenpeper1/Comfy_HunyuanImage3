@@ -5,7 +5,7 @@ Professional custom nodes for running Tencent's HunyuanImage-3.0 model in ComfyU
 Author: Eric Hiss (GitHub: EricRollei)
 Contact: [eric@historic.camera, eric@rollei.us]
 License: Dual License (Non-Commercial and Commercial Use)
-Copyright (c) 2025 Eric Hiss. All rights reserved.
+Copyright (c) 2025-2026 Eric Hiss. All rights reserved.
 
 Dual License:
 1. Non-Commercial Use: This software is licensed under the terms of the

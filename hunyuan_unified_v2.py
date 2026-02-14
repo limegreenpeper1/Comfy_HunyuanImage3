@@ -34,26 +34,28 @@ try:
     from .hunyuan_memory_budget import MemoryBudget, log_vram_status
     from .hunyuan_vae_simple import SimpleVAEManager, VAEPlacement
     from .hunyuan_loader_clean import CleanModelLoader
-    from .hunyuan_block_swap import BlockSwapConfig, BlockSwapManager, calculate_blocks_to_swap
+    from .hunyuan_block_swap import BlockSwapConfig, BlockSwapManager
     from .hunyuan_cache_v2 import get_cache, CachedModel
     from .hunyuan_shared import (
         HUNYUAN_FOLDER_NAME,
         get_available_hunyuan_models,
         patch_dynamic_cache_dtype,
         patch_hunyuan_generate_image,
+        patch_static_cache_lazy_init,
         resolve_hunyuan_model_path,
     )
 except ImportError:
     from hunyuan_memory_budget import MemoryBudget, log_vram_status
     from hunyuan_vae_simple import SimpleVAEManager, VAEPlacement
     from hunyuan_loader_clean import CleanModelLoader
-    from hunyuan_block_swap import BlockSwapConfig, BlockSwapManager, calculate_blocks_to_swap
+    from hunyuan_block_swap import BlockSwapConfig, BlockSwapManager
     from hunyuan_cache_v2 import get_cache, CachedModel
     from hunyuan_shared import (
         HUNYUAN_FOLDER_NAME,
         get_available_hunyuan_models,
         patch_dynamic_cache_dtype,
         patch_hunyuan_generate_image,
+        patch_static_cache_lazy_init,
         resolve_hunyuan_model_path,
     )
 
@@ -61,63 +63,85 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Resolution Presets - Based on HunyuanImage3 Actual Supported Resolutions
+# Resolution Presets for HunyuanImage-3 Base Models
 # =============================================================================
-# HunyuanImage3 uses a 1024 base with standard aspect ratios.
-# Format: "WxH (ratio)": (height, width) - stored as (H,W) for API's HxW format
+# Each tier targets a consistent megapixel count at common photo aspect ratios.
+# All dimensions are divisible by 16 as required by the model.
+# Format: "WxH (ratio)": (height, width) - stored as (H,W) for the pipeline
+#
+# Ratios: 9:16 phone, 2:3 (4x6), 5:7 (5x7), 3:4 (6x8), 4:5 (8x10), 9:10, 1:1
+#
+# Base  ~1.05 MP (1024² target)
+# HD    ~1.50 MP (1224² target, good quality uplift)
+# Large ~2.36 MP (1536² target, 1.5× scale)
 
 RESOLUTION_PRESETS = {
-    # Auto - let model predict from prompt
+    # Auto - let model decide from prompt
     "Auto (model predicts)": "auto",
     
-    # Portrait (tall) - base 1024
-    "576x1024 (9:16 Portrait)": (1024, 576),
-    "640x1024 (5:8 Portrait)": (1024, 640),
-    "672x1024 (2:3 Portrait)": (1024, 672),
-    "768x1024 (3:4 Portrait)": (1024, 768),
-    "864x1024 (~5:6 Portrait)": (1024, 864),
-    "912x1024 (9:10 Portrait)": (1024, 912),
+    # ── ~1 MP Portrait (tall) ──────────────────────────────────
+    "768x1360 (9:16 Portrait)":   (1360, 768),   # 1.04 MP
+    "832x1248 (2:3 Portrait)":    (1248, 832),    # 1.04 MP
+    "864x1216 (5:7 Portrait)":    (1216, 864),    # 1.05 MP
+    "880x1184 (3:4 Portrait)":    (1184, 880),    # 1.04 MP
+    "912x1152 (4:5 Portrait)":    (1152, 912),    # 1.05 MP
+    "976x1072 (9:10 Portrait)":   (1072, 976),    # 1.05 MP
     
-    # Square - base 1024
-    "1024x1024 (1:1 Square)": (1024, 1024),
+    # ── ~1 MP Square ───────────────────────────────────────────
+    "1024x1024 (1:1 Square)":     (1024, 1024),   # 1.05 MP
     
-    # Landscape (wide) - base 1024
-    "1024x912 (10:9 Landscape)": (912, 1024),
-    "1024x864 (~6:5 Landscape)": (864, 1024),
-    "1024x768 (4:3 Landscape)": (768, 1024),
-    "1024x672 (3:2 Landscape)": (672, 1024),
-    "1024x640 (8:5 Landscape)": (640, 1024),
-    "1024x576 (16:9 Landscape)": (576, 1024),
+    # ── ~1 MP Landscape (wide) ─────────────────────────────────
+    "1072x976 (10:9 Landscape)":  (976, 1072),    # 1.05 MP
+    "1152x912 (5:4 Landscape)":   (912, 1152),    # 1.05 MP
+    "1184x880 (4:3 Landscape)":   (880, 1184),    # 1.04 MP
+    "1216x864 (7:5 Landscape)":   (864, 1216),    # 1.05 MP
+    "1248x832 (3:2 Landscape)":   (832, 1248),    # 1.04 MP
+    "1360x768 (16:9 Landscape)":  (768, 1360),    # 1.04 MP
     
-    # Large Portrait - 1.5x scale
-    "864x1536 (9:16 Large)": (1536, 864),
-    "1008x1536 (2:3 Large)": (1536, 1008),
-    "1152x1536 (3:4 Large)": (1536, 1152),
+    # ── ~1.5 MP HD Portrait ──────────────────────────────────
+    "912x1632 (9:16 HD)":        (1632, 912),    # 1.49 MP
+    "992x1504 (2:3 HD)":         (1504, 992),    # 1.49 MP
+    "1040x1456 (5:7 HD)":        (1456, 1040),   # 1.51 MP
+    "1056x1408 (3:4 HD)":        (1408, 1056),   # 1.49 MP
+    "1088x1376 (4:5 HD)":        (1376, 1088),   # 1.50 MP
+    "1168x1296 (9:10 HD)":       (1296, 1168),   # 1.51 MP
     
-    # Large Square
-    "1536x1536 (1:1 Large)": (1536, 1536),
+    # ── ~1.5 MP HD Square ─────────────────────────────────────
+    "1232x1232 (1:1 HD)":        (1232, 1232),   # 1.52 MP
     
-    # Large Landscape - 1.5x scale
-    "1536x1152 (4:3 Large)": (1152, 1536),
-    "1536x1008 (3:2 Large)": (1008, 1536),
-    "1536x864 (16:9 Large)": (864, 1536),
+    # ── ~1.5 MP HD Landscape ──────────────────────────────────
+    "1296x1168 (10:9 HD)":       (1168, 1296),   # 1.51 MP
+    "1376x1088 (5:4 HD)":        (1088, 1376),   # 1.50 MP
+    "1408x1056 (4:3 HD)":        (1056, 1408),   # 1.49 MP
+    "1456x1040 (7:5 HD)":        (1040, 1456),   # 1.51 MP
+    "1504x992 (3:2 HD)":         (992, 1504),    # 1.49 MP
+    "1632x912 (16:9 HD)":        (912, 1632),    # 1.49 MP
     
-    # XL - 2x scale (high VRAM required)
-    "1152x2048 (9:16 XL)": (2048, 1152),
-    "1536x2048 (3:4 XL)": (2048, 1536),
-    "2048x2048 (1:1 XL)": (2048, 2048),
-    "2048x1536 (4:3 XL)": (1536, 2048),
-    "2048x1152 (16:9 XL)": (1152, 2048),
+    # ── ~2.36 MP Large Portrait ────────────────────────────────
+    "1152x2048 (9:16 Large)":     (2048, 1152),   # 2.36 MP
+    "1248x1888 (2:3 Large)":      (1888, 1248),   # 2.36 MP
+    "1296x1824 (5:7 Large)":      (1824, 1296),   # 2.36 MP
+    "1328x1776 (3:4 Large)":      (1776, 1328),   # 2.36 MP
+    "1376x1712 (4:5 Large)":      (1712, 1376),   # 2.36 MP
+    "1456x1616 (9:10 Large)":     (1616, 1456),   # 2.35 MP
+    
+    # ── ~2.36 MP Large Square ──────────────────────────────────
+    "1536x1536 (1:1 Large)":      (1536, 1536),   # 2.36 MP
+    
+    # ── ~2.36 MP Large Landscape ───────────────────────────────
+    "1616x1456 (10:9 Large)":     (1456, 1616),   # 2.35 MP
+    "1712x1376 (5:4 Large)":      (1376, 1712),   # 2.36 MP
+    "1776x1328 (4:3 Large)":      (1328, 1776),   # 2.36 MP
+    "1824x1296 (7:5 Large)":      (1296, 1824),   # 2.36 MP
+    "1888x1248 (3:2 Large)":      (1248, 1888),   # 2.36 MP
+    "2048x1152 (16:9 Large)":     (1152, 2048),   # 2.36 MP
 }
 
 # List of resolution names for dropdown
 RESOLUTION_LIST = list(RESOLUTION_PRESETS.keys())
 
-# System prompt modes for base text-to-image generation
-# - disabled: No system prompt
-# - vanilla: Basic "you are an AI image generator" prompt
-# For prompt enhancement (recaption, CoT), use the Instruct nodes
-SYSTEM_PROMPT_MODES = ["disabled", "vanilla"]
+# System prompts (recaption, CoT, etc.) require Instruct models.
+# Base models don't benefit from system_prompt, so we hardcode disabled.
 
 
 def detect_quant_type(model_name: str) -> str:
@@ -161,18 +185,14 @@ class HunyuanUnifiedV2:
     
     Features:
     - Multi-GPU support with device_map distribution (BF16/INT8)
-    - Explicit block swapping for large generations (NF4)
+    - Explicit block swapping for large generations (NF4, BF16)
     - Simple VAE management with auto-tiling
     - Soft unload / restore support (NF4 only)
     - Cache with automatic reuse and resolution-aware invalidation
     - Auto blocks_to_swap calculation
     - Downstream VRAM reserve
     - Auto quant_type detection from model name
-    - Resolution presets matching actual HunyuanImage3 supported sizes
-    
-    System Prompt Modes:
-    - disabled: No system prompt
-    - vanilla: Basic image generation instructions
+    - Resolution presets at common photo ratios (~1MP, ~1.5MP HD, ~2.4MP tiers)
     
     For prompt enhancement (recaption, CoT reasoning), image editing,
     and multi-image fusion, use the Instruct nodes instead.
@@ -202,7 +222,7 @@ class HunyuanUnifiedV2:
                     "tooltip": "Text prompt for image generation."}),
                 "resolution": (RESOLUTION_LIST, {
                     "default": "1024x1024 (1:1 Square)",
-                    "tooltip": "Image resolution. These match HunyuanImage3's actual supported sizes."}),
+                    "tooltip": "Image resolution at common photo ratios (~1MP base, ~1.5MP HD, ~2.4MP large). All divisible by 16."}),
                 "num_inference_steps": ("INT", {
                     "default": 40, "min": 10, "max": 100,
                     "tooltip": "Number of diffusion steps. 40 recommended (very close to 50 in quality). 30-40 typical."}),
@@ -214,12 +234,9 @@ class HunyuanUnifiedV2:
                     "tooltip": "-1 = random seed."}),
             },
             "optional": {
-                "system_prompt_mode": (SYSTEM_PROMPT_MODES, {
-                    "default": "disabled",
-                    "tooltip": "disabled=no system prompt (best quality, matches model defaults), vanilla=basic T2I instruction. For prompt enhancement use the Instruct nodes."}),
                 "blocks_to_swap": ("INT", {
                     "default": -1, "min": -1, "max": 31, 
-                    "tooltip": "-1 = auto calculate. 0 = no swapping (needs ~50GB VRAM for NF4). 1-31 = manual swap count."}),
+                    "tooltip": "-1 = auto calculate. 0 = no swapping (NF4 needs ~50GB; BF16 uses device_map). 1-31 = manual swap count. BF16 with block swap loads to CPU and is much faster than device_map."}),
                 "vae_placement": (["auto", "always_gpu", "managed"], {
                     "default": "auto",
                     "tooltip": "auto: decide based on VRAM. always_gpu: VAE stays on GPU. managed: VAE moves to CPU when not decoding."}),
@@ -238,11 +255,18 @@ class HunyuanUnifiedV2:
                 "force_reload": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Force full reload: clears cache, empties VRAM, reloads model fresh. Use if orphaned VRAM from failed loads."}),
-                "reset_pipeline": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Reset scheduler/pipeline state before each run. Recommended ON to avoid memory fragmentation between runs."}),
             }
         }
+    
+    @classmethod
+    def IS_CHANGED(cls, force_reload: bool = False, seed: int = -1, **kwargs):
+        """Force ComfyUI to re-execute this node when force_reload is True
+        or seed is random (-1). Prevents the execution cache from short-circuiting
+        the generate call, which would leave stale model references in memory."""
+        if force_reload or seed == -1:
+            return float("NaN")
+        # Stable hash for same-inputs caching
+        return ""
     
     def __init__(self):
         self.cache = get_cache()
@@ -267,12 +291,22 @@ class HunyuanUnifiedV2:
         """
         Calculate optimal blocks_to_swap and vae_placement.
         
+        For block-swap mode the question is: given total GPU capacity, how many
+        transformer blocks can stay on GPU after accounting for the non-block
+        model parts (VAE, text encoder, embeddings ~15GB), inference activations,
+        and a safety reserve?  Everything that doesn't fit gets swapped to CPU.
+        
+        Previous bugs (fixed):
+        - model_vram_gb was set to the FULL model weight (80GB) + non-block,
+          but block-swap means only non-block parts live permanently on GPU.
+        - available_vram used current free VRAM (before load), not total GPU
+          capacity.  The model isn't loaded yet at this point.
+        
         Returns:
             Tuple of (blocks_to_swap, vae_placement)
         """
         # Get current VRAM state
         report = self.budget.get_vram_report()
-        available_vram = report.free_gb
         
         # Get model size estimate
         model_est = self.budget.estimate_model_size(quant_type)
@@ -280,23 +314,45 @@ class HunyuanUnifiedV2:
         # Estimate inference VRAM
         inference_vram = self.budget.estimate_inference_vram(width, height)
         
-        # Non-block model VRAM (VAE, text encoder, etc.)
-        non_block_vram = model_est.vae_gb + model_est.text_encoder_gb
+        # Non-block model VRAM (VAE ~3GB, text encoder ~2GB, embeddings/misc ~10GB)
+        # These parts live permanently on GPU regardless of block swap.
+        # The ~10GB misc covers patch_embed, final_layer, time_embed, position
+        # embeddings, and other non-transformer-block parameters.
+        non_block_vram = model_est.vae_gb + model_est.text_encoder_gb + 10.0
         
         # Auto-calculate blocks_to_swap if -1
         if blocks_to_swap == -1:
-            calculated_blocks, details = calculate_blocks_to_swap(
-                available_vram_gb=available_vram,
-                model_vram_gb=model_est.weights_gb + non_block_vram,
-                inference_vram_gb=inference_vram,
-                num_blocks=num_blocks,
-                gb_per_block=gb_per_block,
-                reserve_vram_gb=reserve_vram_gb + 2.0,  # Add 2GB safety margin
-                safety_margin=0.9
-            )
+            # Use TOTAL GPU capacity, not current free VRAM.
+            # The model isn't loaded yet — we're deciding HOW to load it.
+            # Subtract any existing non-Hunyuan allocations (ComfyUI overhead etc.)
+            existing_allocations = report.total_gb - report.free_gb
+            gpu_capacity = report.total_gb - existing_allocations
+            
+            # How much GPU is available for transformer blocks?
+            # Total capacity minus: non-block parts + inference activations + reserve
+            total_reserve = reserve_vram_gb + 2.0  # User reserve + safety margin
+            vram_for_blocks = gpu_capacity - non_block_vram - inference_vram - total_reserve
+            
+            if vram_for_blocks <= 0:
+                # Not enough for even 1 block — swap all but 1
+                calculated_blocks = num_blocks - 1
+                reason = (f"Only {gpu_capacity:.1f}GB available, need "
+                         f"{non_block_vram:.0f}GB non-block + {inference_vram:.0f}GB inference + "
+                         f"{total_reserve:.0f}GB reserve = "
+                         f"{non_block_vram + inference_vram + total_reserve:.0f}GB before blocks")
+            else:
+                # How many blocks fit on GPU?
+                blocks_on_gpu = int(vram_for_blocks / gb_per_block)
+                blocks_on_gpu = max(blocks_on_gpu, 1)   # Keep at least 1 on GPU
+                blocks_on_gpu = min(blocks_on_gpu, num_blocks)  # Can't exceed total
+                calculated_blocks = num_blocks - blocks_on_gpu
+                reason = (f"GPU {gpu_capacity:.1f}GB - {non_block_vram:.0f}GB non-block - "
+                         f"{inference_vram:.0f}GB inference - {total_reserve:.0f}GB reserve = "
+                         f"{vram_for_blocks:.1f}GB for blocks -> "
+                         f"{blocks_on_gpu} of {num_blocks} blocks fit on GPU")
             
             logger.info(f"Auto blocks_to_swap: {calculated_blocks}")
-            logger.info(f"  Reason: {details.get('reason', 'unknown')}")
+            logger.info(f"  {reason}")
             blocks_to_swap = calculated_blocks
         
         # Auto VAE placement
@@ -335,42 +391,50 @@ class HunyuanUnifiedV2:
         megapixels = (width * height) / 1_000_000
         
         if quant_type == "bf16":
-            # Reserve calculation for BF16 with device_map="auto":
-            #
-            # How accelerate handles multi-GPU + CPU offload:
-            #   - Layers assigned to GPU N run their forward pass on GPU N
-            #   - CPU-offloaded (meta) layers execute on GPU 0 (main_device):
-            #     weights are temporarily copied to GPU 0, forward runs, then freed
-            #   - Only ONE layer runs at a time (no pipeline parallelism)
-            #   - Activations are transferred between GPUs via .to() in hooks
-            #
-            # GPU 0 (primary) needs VRAM for:
-            #   1. Per-layer activation peak (~5-8GB for MoE with CFG batch=2)
-            #   2. Temp materialization of largest CPU-offloaded layer (~5GB)
-            #   3. Latent tensors (scale with resolution: ~0.5-3GB)
-            #   4. VAE decode (~0.5GB, happens after model cleanup)
-            #   5. Scheduler/timestep state (~0.5GB)
-            #   6. CUDA overhead and fragmentation (~3-5GB)
-            #
-            # Total primary reserve: ~15-22GB depending on resolution
-            # (NOT 55GB+ like before — that assumed ALL activations pile up at once)
-            
-            # Per-layer activation scales mildly with resolution due to attention
-            # MoE model: 64 experts but only 4 active per token, so activation
-            # memory is dominated by attention (scales with sequence length)
-            activation_per_layer = 6.0 + (megapixels * 1.0)  # ~7GB at 1MP, ~9GB at 3MP
-            temp_offload_layer = 5.0   # Largest layer materialized from CPU
-            latent_cost = 0.5 + (megapixels * 0.8)  # Latent tensors scale with resolution
-            vae_and_overhead = 5.0     # VAE + scheduler + CUDA fragmentation
-            
-            inference_reserve = activation_per_layer + temp_offload_layer + latent_cost + vae_and_overhead
-            
-            # Add user-specified downstream reserve
-            total_reserve = inference_reserve + reserve_vram_gb
-            logger.info(f"BF16 reserve for {megapixels:.1f}MP: {activation_per_layer:.0f}GB activation + "
-                       f"{temp_offload_layer:.0f}GB offload temp + {latent_cost:.1f}GB latent + "
-                       f"{vae_and_overhead:.0f}GB overhead = {inference_reserve:.0f}GB + "
-                       f"{reserve_vram_gb:.0f}GB downstream = {total_reserve:.0f}GB total reserve")
+            if blocks_to_swap > 0:
+                # Block-swap mode: non-block components (~15GB) go to GPU,
+                # blocks are managed by BlockSwapManager (only N on GPU at a time).
+                # The reserve is just for inference activations + user downstream.
+                activation_per_layer = 6.0 + (megapixels * 1.0)
+                latent_cost = 0.5 + (megapixels * 0.8)
+                vae_and_overhead = 5.0
+                inference_reserve = activation_per_layer + latent_cost + vae_and_overhead
+                total_reserve = inference_reserve + reserve_vram_gb
+                logger.info(f"BF16 block-swap reserve for {megapixels:.1f}MP: "
+                           f"{activation_per_layer:.0f}GB activation + {latent_cost:.1f}GB latent + "
+                           f"{vae_and_overhead:.0f}GB overhead = {inference_reserve:.0f}GB + "
+                           f"{reserve_vram_gb:.0f}GB downstream = {total_reserve:.0f}GB total")
+            else:
+                # device_map="auto" mode: accelerate handles CPU offload.
+                # Reserve calculation for BF16 with device_map="auto":
+                #
+                # How accelerate handles multi-GPU + CPU offload:
+                #   - Layers assigned to GPU N run their forward pass on GPU N
+                #   - CPU-offloaded (meta) layers execute on GPU 0 (main_device):
+                #     weights are temporarily copied to GPU 0, forward runs, then freed
+                #   - Only ONE layer runs at a time (no pipeline parallelism)
+                #   - Activations are transferred between GPUs via .to() in hooks
+                #
+                # GPU 0 (primary) needs VRAM for:
+                #   1. Per-layer activation peak (~5-8GB for MoE with CFG batch=2)
+                #   2. Temp materialization of largest CPU-offloaded layer (~5GB)
+                #   3. Latent tensors (scale with resolution: ~0.5-3GB)
+                #   4. VAE decode (~0.5GB, happens after model cleanup)
+                #   5. Scheduler/timestep state (~0.5GB)
+                #   6. CUDA overhead and fragmentation (~3-5GB)
+                #
+                # Total primary reserve: ~15-22GB depending on resolution
+                activation_per_layer = 6.0 + (megapixels * 1.0)
+                temp_offload_layer = 5.0
+                latent_cost = 0.5 + (megapixels * 0.8)
+                vae_and_overhead = 5.0
+                
+                inference_reserve = activation_per_layer + temp_offload_layer + latent_cost + vae_and_overhead
+                total_reserve = inference_reserve + reserve_vram_gb
+                logger.info(f"BF16 device_map reserve for {megapixels:.1f}MP: {activation_per_layer:.0f}GB activation + "
+                           f"{temp_offload_layer:.0f}GB offload temp + {latent_cost:.1f}GB latent + "
+                           f"{vae_and_overhead:.0f}GB overhead = {inference_reserve:.0f}GB + "
+                           f"{reserve_vram_gb:.0f}GB downstream = {total_reserve:.0f}GB total reserve")
         else:
             # NF4/INT8 fit on GPU, use user-specified reserve only
             total_reserve = reserve_vram_gb if reserve_vram_gb > 0 else 10.0
@@ -383,10 +447,10 @@ class HunyuanUnifiedV2:
         
         if cached:
             logger.info(f"Cache hit: is_on_gpu={cached.is_on_gpu}, loaded_with_reserve_gb={cached.loaded_with_reserve_gb:.1f}")
-            # For BF16 models: check if cached model was loaded with ENOUGH reserve
-            # If current resolution needs more reserve than model was loaded with,
-            # we MUST reload to get proper GPU/CPU split
-            if quant_type == "bf16":
+            # For BF16 device_map models: check if cached model was loaded with
+            # ENOUGH reserve.  Block-swap models don't need this check because
+            # blocks_to_swap controls how much GPU is used, not reserve_vram_gb.
+            if quant_type == "bf16" and not cached.is_moveable:
                 cached_reserve = cached.loaded_with_reserve_gb
                 
                 # If loaded_with_reserve_gb is 0, this is an old cache entry
@@ -431,8 +495,10 @@ class HunyuanUnifiedV2:
                 if quant_type == "bf16":
                     if torch.cuda.is_available():
                         allocated_gb = torch.cuda.memory_allocated(0) / 1024**3
-                        # BF16 model should have at least 30GB on GPU
-                        if allocated_gb < 30.0:
+                        # BF16 device_map should have at least 30GB on GPU.
+                        # BF16 block-swap has ~15GB of non-block components on GPU.
+                        min_expected_gb = 10.0 if cached.is_moveable else 30.0
+                        if allocated_gb < min_expected_gb:
                             logger.warning(f"Cache says BF16 model loaded but only {allocated_gb:.1f}GB in VRAM!")
                             logger.warning("Model appears to have been garbage collected. Invalidating cache...")
                             self.cache.full_unload()
@@ -479,22 +545,21 @@ class HunyuanUnifiedV2:
             quant_type=quant_type,
             device=device,
             dtype=torch.bfloat16,
-            reserve_vram_gb=total_reserve
+            reserve_vram_gb=total_reserve,
+            blocks_to_swap=blocks_to_swap,
         )
         
         log_vram_status(device, "After load")
         
         # Verify model loaded properly - check parameter distribution
-        # For BF16 with device_map="auto", we expect: CUDA (on-GPU layers) + meta (CPU-offloaded)
-        # Meta is NORMAL for CPU-offloaded layers - accelerate uses AlignDevicesHook to
-        # materialize them on the execution device during forward pass.
+        # For BF16 with device_map="auto": CUDA + meta (CPU-offloaded via hooks)
+        # For BF16 with block swap: CUDA (non-block parts) + CPU (transformer blocks)
         if quant_type == "bf16":
             meta_count = 0
             cuda_count = 0
             cpu_count = 0
             total_count = 0
             
-            # Count ALL parameters (not just first N - that biases toward GPU-resident early layers)
             for param in result.model.parameters():
                 total_count += 1
                 if param.device.type == 'meta':
@@ -504,20 +569,26 @@ class HunyuanUnifiedV2:
                 elif param.device.type == 'cpu':
                     cpu_count += 1
             
-            logger.info(f"Model tensor placement ({total_count} total): {cuda_count} CUDA, {cpu_count} CPU, {meta_count} meta (CPU-offloaded)")
+            logger.info(f"Model tensor placement ({total_count} total): {cuda_count} CUDA, {cpu_count} CPU, {meta_count} meta")
             
-            # With device_map, cuda+meta is the expected pattern (meta = CPU-offloaded via hooks)
-            # Only fail if EVERYTHING is on meta (no GPU layers at all)
-            if cuda_count == 0:
-                logger.error("=" * 60)
-                logger.error("CRITICAL: No model tensors on GPU!")
-                logger.error("The model failed to place any layers on GPU.")
-                logger.error("Possible causes:")
-                logger.error("  1. Not enough GPU VRAM (reserve too high?)")
-                logger.error("  2. Other models consuming GPU memory")
-                logger.error("  3. accelerate library version incompatibility")
-                logger.error("=" * 60)
-                raise RuntimeError("Model failed to place any layers on GPU")
+            if result.is_moveable:
+                # Block-swap mode: expect CUDA (non-blocks) + CPU (blocks).
+                # BlockSwapManager will move blocks to GPU as needed.
+                if cuda_count == 0 and cpu_count == 0:
+                    raise RuntimeError("BF16 block-swap model has no tensors on CUDA or CPU")
+                logger.info("BF16 block-swap mode: non-block components on GPU, blocks on CPU")
+            else:
+                # device_map mode: expect CUDA + meta
+                if cuda_count == 0:
+                    logger.error("=" * 60)
+                    logger.error("CRITICAL: No model tensors on GPU!")
+                    logger.error("The model failed to place any layers on GPU.")
+                    logger.error("Possible causes:")
+                    logger.error("  1. Not enough GPU VRAM (reserve too high?)")
+                    logger.error("  2. Other models consuming GPU memory")
+                    logger.error("  3. accelerate library version incompatibility")
+                    logger.error("=" * 60)
+                    raise RuntimeError("Model failed to place any layers on GPU")
         
         # Load tokenizer (required for generate_image)
         if hasattr(result.model, 'load_tokenizer'):
@@ -527,6 +598,7 @@ class HunyuanUnifiedV2:
         # Apply critical patches (matches working BF16 loader)
         logger.info("Applying dtype compatibility patches...")
         patch_dynamic_cache_dtype()
+        patch_static_cache_lazy_init()
         patch_hunyuan_generate_image(result.model)
         
         # Apply pre-VAE cleanup patch - critical for BF16/device_map models
@@ -636,8 +708,6 @@ class HunyuanUnifiedV2:
         seed: int,
         enable_vae_tiling: bool,
         flow_shift: float = 2.8,
-        system_prompt_mode: str = "vanilla",
-        reset_pipeline: bool = True,
     ) -> Tuple[List[Image.Image], str]:
         """
         Run the inference pipeline using generate_image() API.
@@ -686,40 +756,35 @@ class HunyuanUnifiedV2:
             block_swap_manager.reset_stats()
         
         try:
-            # Reset pipeline state if requested (recommended ON to avoid fragmentation)
-            if reset_pipeline:
-                logger.info("Resetting pipeline state for fresh run...")
-                # Reset scheduler state that might persist between runs
-                if hasattr(model, '_pipeline') and model._pipeline is not None:
-                    pipeline = model._pipeline
-                    scheduler = pipeline.scheduler
-                    
-                    # Clear scheduler state
-                    if hasattr(scheduler, '_step_index'):
-                        scheduler._step_index = None
-                    if hasattr(scheduler, 'sigmas'):
-                        del scheduler.sigmas
-                    if hasattr(scheduler, 'timesteps'):
-                        scheduler.timesteps = None
-                    if hasattr(scheduler, '_begin_index'):
-                        scheduler._begin_index = None
-                    
-                    # Clear any cached model outputs from previous runs
-                    if hasattr(pipeline, 'model_kwargs'):
-                        # Clear past_key_values which can accumulate
-                        if 'past_key_values' in pipeline.model_kwargs:
-                            del pipeline.model_kwargs['past_key_values']
-                        # Clear other cached states  
-                        if 'output_hidden_states' in pipeline.model_kwargs:
-                            del pipeline.model_kwargs['output_hidden_states']
-                    
-                    logger.debug("  Scheduler and pipeline state reset")
+            # Reset pipeline state before each run to avoid fragmentation
+            if hasattr(model, '_pipeline') and model._pipeline is not None:
+                pipeline = model._pipeline
+                scheduler = pipeline.scheduler
                 
-                # Also clear any model-level generation cache
-                if hasattr(model, '_cache'):
-                    model._cache = None
-                if hasattr(model, 'past_key_values'):
-                    model.past_key_values = None
+                # Clear scheduler state
+                if hasattr(scheduler, '_step_index'):
+                    scheduler._step_index = None
+                if hasattr(scheduler, 'sigmas'):
+                    del scheduler.sigmas
+                if hasattr(scheduler, 'timesteps'):
+                    scheduler.timesteps = None
+                if hasattr(scheduler, '_begin_index'):
+                    scheduler._begin_index = None
+                
+                # Clear any cached model outputs from previous runs
+                if hasattr(pipeline, 'model_kwargs'):
+                    if 'past_key_values' in pipeline.model_kwargs:
+                        del pipeline.model_kwargs['past_key_values']
+                    if 'output_hidden_states' in pipeline.model_kwargs:
+                        del pipeline.model_kwargs['output_hidden_states']
+                
+                logger.debug("Scheduler and pipeline state reset")
+            
+            # Also clear any model-level generation cache
+            if hasattr(model, '_cache'):
+                model._cache = None
+            if hasattr(model, 'past_key_values'):
+                model.past_key_values = None
             
             # Aggressive memory cleanup before inference to defragment CUDA memory
             # This is critical for BF16 models where VRAM is tight
@@ -779,23 +844,12 @@ class HunyuanUnifiedV2:
                     return callback_kwargs
                 gen_kwargs["callback_on_step_end"] = progress_callback
             
-            # Add system prompt options
-            # V2 base node only supports disabled/vanilla modes.
-            # Recaption, think_recaption, and custom modes (which require bot_task
-            # and text generation) are available in the Instruct nodes.
-            # 
-            # How HunyuanImage-3 API works for base generation:
-            # - use_system_prompt: which system prompt template to use
-            # - For vanilla mode: just tells the model to generate a high-quality image
-            # - No bot_task needed for base text-to-image generation
-            if system_prompt_mode == "vanilla":
-                gen_kwargs["use_system_prompt"] = "en_vanilla"
+            # No system prompt for base models — prompt enhancement
+            # (recaption, CoT) requires the Instruct nodes.
             
             # Log generation parameters
             logger.info(f"Calling generate_image:")
             logger.info(f"  size={image_size}, steps={num_inference_steps}, cfg={guidance_scale}, seed={seed}")
-            if system_prompt_mode != "disabled":
-                logger.info(f"  system_prompt_mode={system_prompt_mode}")
             if block_swap_manager:
                 # Use actual stats from block placement detection
                 gpu_blocks = block_swap_manager.stats.blocks_currently_on_gpu
@@ -920,7 +974,6 @@ class HunyuanUnifiedV2:
         num_inference_steps: int,
         guidance_scale: float,
         seed: int,
-        system_prompt_mode: str = "vanilla",
         blocks_to_swap: int = -1,
         vae_placement: str = "auto",
         post_action: str = "keep_loaded",
@@ -928,7 +981,6 @@ class HunyuanUnifiedV2:
         flow_shift: float = 2.8,
         reserve_vram_gb: float = 0.0,
         force_reload: bool = False,
-        reset_pipeline: bool = True,
     ) -> Tuple[torch.Tensor]:
         """
         Generate images using HunyuanImage-3.0.
@@ -956,17 +1008,22 @@ class HunyuanUnifiedV2:
                 # Get current cache status
                 status = self.cache.get_status()
                 if status.get("cached"):
-                    # Remove hooks first
+                    # Clean up BlockSwapManager first (break circular refs for RAM cleanup)
                     cached = self.cache.get(status["model_path"], status["quant_type"])
                     if cached and cached.block_swap_manager:
-                        if cached.block_swap_manager.hooks_installed:
+                        if hasattr(cached.block_swap_manager, 'cleanup'):
+                            cached.block_swap_manager.cleanup()
+                            cached.block_swap_manager = None
+                            logger.info("  BlockSwapManager cleaned up (circular refs broken)")
+                        elif cached.block_swap_manager.hooks_installed:
                             cached.block_swap_manager.remove_hooks()
                             logger.info("  Removed block swap hooks")
                     # Full unload
                     self.cache.full_unload()
                     logger.info("  Cache cleared")
                 
-                # Force garbage collection
+                # Force garbage collection (multiple rounds for nested cycles)
+                gc.collect()
                 gc.collect()
                 gc.collect()
                 
@@ -976,6 +1033,13 @@ class HunyuanUnifiedV2:
                     torch.cuda.synchronize()
                     logger.info("  CUDA cache emptied")
                 
+                # Force Windows to return freed memory to OS
+                try:
+                    from .hunyuan_shared import force_windows_memory_release
+                except ImportError:
+                    from hunyuan_shared import force_windows_memory_release
+                force_windows_memory_release()
+                
                 log_vram_status(device, "After force reload cleanup")
             except Exception as e:
                 logger.warning(f"Force reload cleanup error (continuing anyway): {e}")
@@ -983,15 +1047,20 @@ class HunyuanUnifiedV2:
         # Auto-detect quant type from model name
         quant_type = detect_quant_type(model_name)
         
-        # CRITICAL: INT8 and BF16 models use device_map and CANNOT use block swapping
-        # Force blocks_to_swap=0 BEFORE loading to prevent issues
-        if quant_type in ("int8", "bf16"):
+        # INT8 models use device_map and CANNOT use block swapping.
+        # BF16 models CAN use block swapping (load to CPU, BlockSwapManager).
+        if quant_type == "int8":
             if blocks_to_swap != 0:
-                logger.info(f"{quant_type.upper()} model detected - forcing blocks_to_swap=0 (device_map models cannot block swap)")
+                logger.info("INT8 model detected - forcing blocks_to_swap=0 (device_map models cannot block swap)")
                 blocks_to_swap = 0
-            # Also force post_action since soft_unload won't work
             if post_action == "soft_unload":
-                logger.info(f"{quant_type.upper()} model cannot soft_unload - using keep_loaded instead")
+                logger.info("INT8 model cannot soft_unload - using keep_loaded instead")
+                post_action = "keep_loaded"
+        elif quant_type == "bf16":
+            # BF16 supports block swap (load to CPU + BlockSwapManager).
+            # When blocks_to_swap=0, fall back to device_map="auto" (not moveable).
+            if blocks_to_swap == 0 and post_action == "soft_unload":
+                logger.info("BF16 model without block swap cannot soft_unload - using keep_loaded instead")
                 post_action = "keep_loaded"
         
         # NF4 and BF16 models benefit from VAE tiling
@@ -1018,8 +1087,7 @@ class HunyuanUnifiedV2:
         logger.info(f"Model: {model_name} (auto-detected: {quant_type})")
         logger.info(f"Resolution: {resolution} -> {image_size}")
         logger.info(f"Steps: {num_inference_steps}, CFG: {guidance_scale}, Seed: {seed}")
-        if system_prompt_mode != "disabled":
-            logger.info(f"System prompt mode: {system_prompt_mode}")
+
         
         # Log VRAM state
         report = self.budget.get_vram_report()
@@ -1085,8 +1153,6 @@ class HunyuanUnifiedV2:
                     seed=seed,
                     enable_vae_tiling=enable_vae_tiling,
                     flow_shift=flow_shift,
-                    system_prompt_mode=system_prompt_mode,
-                    reset_pipeline=reset_pipeline,
                 )
             finally:
                 # Always restore original resolution handling
@@ -1114,9 +1180,9 @@ class HunyuanUnifiedV2:
             logger.error("OOM TROUBLESHOOTING:")
             logger.error("  1. Reduce image resolution (try 1024x1024 or smaller)")
             logger.error("  2. Enable VAE tiling (checkbox in node)")
-            logger.error("  3. For BF16 models: increase reserve_vram_gb (try 30-35)")
+            logger.error("  3. For BF16: try blocks_to_swap > 0 (e.g. 20-25) to use block swap instead of device_map")
             logger.error("  4. For repeated runs: restart ComfyUI to clear CUDA fragmentation")
-            logger.error("  5. Try NF4 quantized model instead of BF16 (uses ~45GB vs ~65GB)")
+            logger.error("  5. Try NF4 quantized model instead of BF16 (uses ~29GB vs ~160GB)")
             logger.error("=" * 60)
             
             # Try to recover VRAM
@@ -1165,6 +1231,9 @@ class HunyuanUnloadV2:
     
     def unload(self, unload_type: str):
         """Unload the cached model."""
+        import psutil
+        ram_before = psutil.Process().memory_info().rss / 1024**3
+        
         cache = get_cache()
         status = cache.get_status()
         
@@ -1175,7 +1244,11 @@ class HunyuanUnloadV2:
         # Get cached model to clean up hooks
         cached = cache.get(status["model_path"], status["quant_type"])
         if cached and cached.block_swap_manager:
-            if cached.block_swap_manager.hooks_installed:
+            # Use full cleanup if available (breaks circular refs)
+            if hasattr(cached.block_swap_manager, 'cleanup'):
+                cached.block_swap_manager.cleanup()
+                cached.block_swap_manager = None
+            elif cached.block_swap_manager.hooks_installed:
                 cached.block_swap_manager.remove_hooks()
         
         if unload_type == "soft_unload":
@@ -1186,7 +1259,19 @@ class HunyuanUnloadV2:
                 logger.warning("Model is not moveable, cannot soft unload")
         else:
             cache.full_unload()
-            logger.info("Model fully unloaded")
+            # Extra gc rounds
+            gc.collect()
+            gc.collect()
+            # Force Windows to return freed memory to OS
+            try:
+                from .hunyuan_shared import force_windows_memory_release
+            except ImportError:
+                from hunyuan_shared import force_windows_memory_release
+            force_windows_memory_release()
+            ram_after = psutil.Process().memory_info().rss / 1024**3
+            ram_freed = ram_before - ram_after
+            logger.info(f"Model fully unloaded. RAM freed: {ram_freed:.1f}GB "
+                       f"(before: {ram_before:.1f}GB, after: {ram_after:.1f}GB)")
         
         log_vram_status("cuda:0", f"After {unload_type}")
         return ()
@@ -1387,9 +1472,12 @@ class HunyuanEmergencyCleanup:
         results = []
         budget = MemoryBudget()
         
-        # Get VRAM before cleanup
+        # Get VRAM and RAM before cleanup
         before = budget.get_vram_report()
-        results.append(f"Before cleanup: {before.allocated_gb:.1f}GB allocated, {before.free_gb:.1f}GB free")
+        import psutil
+        ram_before = psutil.Process().memory_info().rss / 1024**3
+        results.append(f"Before cleanup: VRAM {before.allocated_gb:.1f}GB allocated, "
+                      f"{before.free_gb:.1f}GB free | RAM {ram_before:.1f}GB")
         
         try:
             # Step 1: Clear the cache (removes hooks too)
@@ -1397,15 +1485,19 @@ class HunyuanEmergencyCleanup:
             status = cache.get_status()
             
             if status.get("cached"):
-                # Try to remove hooks first
+                # Try to clean up BlockSwapManager first (break circular refs)
                 cached = cache.get(status["model_path"], status["quant_type"])
                 if cached and cached.block_swap_manager:
                     try:
-                        if cached.block_swap_manager.hooks_installed:
+                        if hasattr(cached.block_swap_manager, 'cleanup'):
+                            cached.block_swap_manager.cleanup()
+                            cached.block_swap_manager = None
+                            results.append("BlockSwapManager fully cleaned up (circular refs broken)")
+                        elif cached.block_swap_manager.hooks_installed:
                             cached.block_swap_manager.remove_hooks()
-                        results.append("Removed block swap hooks")
+                            results.append("Removed block swap hooks")
                     except Exception as e:
-                        results.append(f"Warning: Failed to remove hooks: {e}")
+                        results.append(f"Warning: Failed to cleanup block swap: {e}")
                 
                 # Force unload
                 cache.full_unload()
@@ -1444,14 +1536,18 @@ class HunyuanEmergencyCleanup:
             except Exception as e:
                 results.append(f"Warning: Module hook cleanup failed: {e}")
             
-            # Get VRAM after cleanup
+            # Get VRAM and RAM after cleanup
+            gc.collect()
             gc.collect()
             torch.cuda.empty_cache()
             after = budget.get_vram_report()
+            ram_after = psutil.Process().memory_info().rss / 1024**3
             
-            freed = before.allocated_gb - after.allocated_gb
-            results.append(f"\nAfter cleanup: {after.allocated_gb:.1f}GB allocated, {after.free_gb:.1f}GB free")
-            results.append(f"Freed: {freed:.1f}GB")
+            vram_freed = before.allocated_gb - after.allocated_gb
+            ram_freed = ram_before - ram_after
+            results.append(f"\nAfter cleanup: VRAM {after.allocated_gb:.1f}GB allocated, "
+                          f"{after.free_gb:.1f}GB free | RAM {ram_after:.1f}GB")
+            results.append(f"Freed: VRAM {vram_freed:.1f}GB, RAM {ram_freed:.1f}GB")
             
             return ("\n".join(results),)
             

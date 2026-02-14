@@ -191,6 +191,10 @@ class HunyuanImage3MoETest:
             
             try:
                 image = model.generate_image(**gen_kwargs)
+            except torch.cuda.OutOfMemoryError:
+                logger.error("CUDA out of memory during MoE test generation!")
+                logger.error("  Try: increase blocks_to_swap, lower resolution, or use NF4/INT8")
+                raise
             finally:
                 # Restore resolution group
                 if original_get_target_size is not None:

@@ -22,6 +22,7 @@ PARTICULAR PURPOSE AND NONINFRINGEMENT.
 Note: HunyuanImage-3.0 model is subject to Tencent's Apache 2.0 license.
 """
 
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -29,8 +30,27 @@ from typing import List, Optional
 
 import psutil
 import torch
+import transformers
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Transformers version detection
+# ---------------------------------------------------------------------------
+_TRANSFORMERS_VERSION: tuple = tuple(
+    int(x) for x in transformers.__version__.split(".")[:2]
+)
+"""Parsed (major, minor) of the installed transformers package."""
+
+_TRANSFORMERS_GTE_5 = _TRANSFORMERS_VERSION >= (5, 0)
+"""True when running transformers >= 5.0 (lazy_initialization signature change)."""
+
+logger.info(
+    "Transformers %s detected (parsed %s, >=5.0: %s)",
+    transformers.__version__,
+    _TRANSFORMERS_VERSION,
+    _TRANSFORMERS_GTE_5,
+)
 
 # ---------------------------------------------------------------------------
 # ComfyUI folder_paths integration
@@ -208,6 +228,7 @@ _ORIGINAL_INDEX_COPY = None
 _ORIGINAL_INDEX_COPY_INPLACE = None
 _DYNAMIC_CACHE_PATCHED = False
 _ORIGINAL_DYNAMIC_CACHE_UPDATE = None
+_STATIC_CACHE_LAZY_INIT_PATCHED = False
 _DTYPE_HOOKS_INSTALLED = False
 _MOE_EFFICIENT_PATCHED = False
 _MOE_ORIGINAL_FORWARDS = {}  # module id -> original forward
@@ -336,8 +357,17 @@ def unpatch_moe_efficient_forward(model) -> None:
     if restored_count > 0:
         logger.info(f"Restored {restored_count} HunyuanMoE layers to original forward")
     
-    if not _MOE_ORIGINAL_FORWARDS:
-        _MOE_EFFICIENT_PATCHED = False
+    # Safety net: force-clear any orphaned entries (e.g. if model was
+    # partially cleaned up and named_modules() missed some).
+    # These entries hold bound methods whose __self__ keeps MoE modules
+    # and all their expert weight tensors alive in RAM.
+    orphaned = len(_MOE_ORIGINAL_FORWARDS)
+    if orphaned > 0:
+        logger.warning(f"Force-clearing {orphaned} orphaned MoE forward entries "
+                       f"from global _MOE_ORIGINAL_FORWARDS dict")
+        _MOE_ORIGINAL_FORWARDS.clear()
+    
+    _MOE_EFFICIENT_PATCHED = False
 
 
 def install_dtype_harmonization_hooks(model) -> None:
@@ -609,40 +639,48 @@ def patch_dynamic_cache_dtype() -> None:
 
     _ORIGINAL_DYNAMIC_CACHE_UPDATE = DynamicCache.update
 
-    def _cast(obj, target_dtype: torch.dtype):
-        if target_dtype is None:
-            return obj
-        if isinstance(obj, torch.Tensor):
-            return obj.to(dtype=target_dtype) if obj.dtype != target_dtype else obj
-        if isinstance(obj, (list, tuple)):
-            casted = [
-                _cast(item, target_dtype) for item in obj
-            ]
-            return type(obj)(casted)
-        return obj
-
-    def _get_cache_dtype(cache, idx):
+    def _get_cache_info(cache, idx):
+        """Return (dtype, device) of the cache entry at *idx*, or (None, None)."""
         if not hasattr(cache, "__len__"):
-            return None
+            return None, None
         if idx >= len(cache):
-            return None
+            return None, None
         entry = cache[idx]
         if isinstance(entry, torch.Tensor):
-            return entry.dtype
+            return entry.dtype, entry.device
         if isinstance(entry, (list, tuple)) and entry:
             first = entry[0]
             if isinstance(first, torch.Tensor):
-                return first.dtype
-        return None
+                return first.dtype, first.device
+        return None, None
+
+    def _harmonize(obj, target_dtype, target_device):
+        """Cast *obj* to *target_dtype* and/or move to *target_device*."""
+        if target_dtype is None and target_device is None:
+            return obj
+        if isinstance(obj, torch.Tensor):
+            needs_dtype = target_dtype is not None and obj.dtype != target_dtype
+            needs_device = target_device is not None and obj.device != target_device
+            if needs_dtype or needs_device:
+                kw = {}
+                if needs_dtype:
+                    kw["dtype"] = target_dtype
+                if needs_device:
+                    kw["device"] = target_device
+                return obj.to(**kw)
+            return obj
+        if isinstance(obj, (list, tuple)):
+            return type(obj)(_harmonize(item, target_dtype, target_device) for item in obj)
+        return obj
 
     def _patched_update(self, key_states, value_states, layer_idx, cache_kwargs=None):
-        key_dtype = _get_cache_dtype(self.key_cache, layer_idx) if hasattr(self, "key_cache") else None
-        value_dtype = _get_cache_dtype(self.value_cache, layer_idx) if hasattr(self, "value_cache") else key_dtype
+        key_dtype, key_device = _get_cache_info(self.key_cache, layer_idx) if hasattr(self, "key_cache") else (None, None)
+        value_dtype, value_device = _get_cache_info(self.value_cache, layer_idx) if hasattr(self, "value_cache") else (key_dtype, key_device)
 
-        if key_dtype is not None:
-            key_states = _cast(key_states, key_dtype)
-        if value_dtype is not None:
-            value_states = _cast(value_states, value_dtype)
+        if key_dtype is not None or key_device is not None:
+            key_states = _harmonize(key_states, key_dtype, key_device)
+        if value_dtype is not None or value_device is not None:
+            value_states = _harmonize(value_states, value_dtype, value_device)
 
         return _ORIGINAL_DYNAMIC_CACHE_UPDATE(
             self,
@@ -654,7 +692,167 @@ def patch_dynamic_cache_dtype() -> None:
 
     DynamicCache.update = _patched_update  # type: ignore[assignment]
     _DYNAMIC_CACHE_PATCHED = True
-    logger.info("Patched DynamicCache.update to harmonize KV dtype")
+    logger.info("Patched DynamicCache.update to harmonize KV dtype and device")
+
+
+# ---------------------------------------------------------------------------
+# HunyuanStaticCache device harmonization (fixes multi-GPU mismatch)
+# ---------------------------------------------------------------------------
+
+def patch_hunyuan_static_cache_device(model) -> bool:
+    """Patch ``HunyuanStaticCache.update`` to harmonize device on Path B.
+
+    The model's ``HunyuanStaticCache`` (defined in the checkpoint's
+    ``hunyuan.py``) has **two code paths** in its ``update()`` method:
+
+    - **Path A** (old transformers — ``self.key_cache`` list):  Already has a
+      device migration guard that moves the cached tensor to ``key_states.device``.
+    - **Path B** (new transformers ≥5.0 — ``self.layers[idx].keys``):  **No**
+      device migration.  If the lazily-initialised cache tensor ends up on a
+      different device than subsequent ``key_states`` (common with
+      ``CUDA_VISIBLE_DEVICES`` remapping, accelerate hooks, or multi-GPU
+      device maps), the ``index_copy_`` call crashes with:
+      ``RuntimeError: Expected all tensors to be on the same device``.
+
+    This function monkey-patches the loaded model's ``HunyuanStaticCache.update``
+    to add the missing device migration on Path B, exactly mirroring Path A.
+
+    Must be called **after** the model is loaded (the class is dynamically
+    imported via ``trust_remote_code=True``).
+
+    Args:
+        model: The loaded ``HunyuanImage3ForCausalMM`` model instance.
+
+    Returns:
+        ``True`` if the patch was applied, ``False`` otherwise.
+    """
+    # Find the HunyuanStaticCache class from the model's module
+    cache_cls = None
+    try:
+        # The model's module is registered under its config's auto_map
+        model_module = type(model).__module__
+        import importlib
+        mod = importlib.import_module(model_module)
+        cache_cls = getattr(mod, "HunyuanStaticCache", None)
+    except Exception:
+        pass
+
+    if cache_cls is None:
+        # Fallback: walk the model's class hierarchy
+        try:
+            import sys
+            for mod_name, mod in sys.modules.items():
+                if mod is not None and hasattr(mod, "HunyuanStaticCache"):
+                    cache_cls = getattr(mod, "HunyuanStaticCache")
+                    break
+        except Exception:
+            pass
+
+    if cache_cls is None:
+        logger.warning("HunyuanStaticCache not found; device harmonization patch skipped")
+        return False
+
+    # Check if already patched
+    if getattr(cache_cls, "_device_patch_applied", False):
+        return True
+
+    _original_update = cache_cls.update
+
+    def _device_patched_update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        """Wrapper that adds device migration for the StaticLayer (Path B) code path."""
+        # Path B: self.layers[layer_idx].keys (transformers >=5.0 with StaticLayer)
+        if not (hasattr(self, "key_cache") and hasattr(self, "value_cache")):
+            # This is Path B — check if cache is initialised and on wrong device
+            if hasattr(self, "layers") and layer_idx < len(self.layers):
+                layer = self.layers[layer_idx]
+                if getattr(layer, "keys", None) is not None:
+                    if layer.keys.device != key_states.device:
+                        layer.keys = layer.keys.to(key_states.device)
+                        layer.values = layer.values.to(value_states.device)
+
+        return _original_update(self, key_states, value_states, layer_idx, cache_kwargs)
+
+    cache_cls.update = _device_patched_update
+    cache_cls._device_patch_applied = True
+    logger.info("Patched HunyuanStaticCache.update with device harmonization (multi-GPU fix)")
+    return True
+
+
+def patch_static_cache_lazy_init() -> None:
+    """Patch ``StaticLayer.lazy_initialization`` for transformers >=5.0 compat.
+
+    **The problem**:  The HunyuanImage-3 model's ``HunyuanStaticCache.update()``
+    calls ``self.layers[layer_idx].lazy_initialization(key_states)`` with a
+    single positional argument.  In transformers <=4.57 the ``StaticLayer``
+    signature was ``lazy_initialization(self, key_states)`` — one positional arg
+    was correct.  Starting with transformers 5.0 the signature changed to
+    ``lazy_initialization(self, key_states, value_states)`` (two positional
+    args), so the model's single-arg call crashes with a ``TypeError``.
+
+    **The fix**:  We monkey-patch ``StaticLayer.lazy_initialization`` to accept
+    ``value_states`` as an **optional** second argument.  When it is omitted
+    (the model's call path) we derive ``v_head_dim`` from ``key_states``,
+    which is correct for HunyuanImage-3 because its key and value heads have
+    the same dimension.
+
+    The patch is only applied when transformers >=5.0 is detected and is
+    completely harmless for <=4.57 (it will simply not be invoked).
+    """
+    global _STATIC_CACHE_LAZY_INIT_PATCHED
+
+    if _STATIC_CACHE_LAZY_INIT_PATCHED:
+        return
+
+    if not _TRANSFORMERS_GTE_5:
+        # On transformers <=4.57 the old 1-arg signature is still in place —
+        # nothing to patch.
+        return
+
+    try:
+        from transformers.cache_utils import StaticLayer
+    except ImportError:
+        logger.warning("transformers.cache_utils.StaticLayer unavailable; "
+                       "lazy_init compat patch skipped")
+        return
+
+    _original_lazy_init = StaticLayer.lazy_initialization
+
+    # Check how many positional params the current implementation expects
+    # (excluding ``self``).  If it already accepts 1, no patch needed.
+    sig = inspect.signature(_original_lazy_init)
+    # Parameters excluding 'self'
+    params = [
+        p for name, p in sig.parameters.items()
+        if name != "self"
+    ]
+    positional_params = [
+        p for p in params
+        if p.default is inspect.Parameter.empty
+        and p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                       inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+
+    if len(positional_params) < 2:
+        # Already accepts 1 required positional arg — nothing to do.
+        _STATIC_CACHE_LAZY_INIT_PATCHED = True
+        return
+
+    # transformers >=5.0: lazy_initialization(self, key_states, value_states)
+    # Make value_states optional so the model's 1-arg call works.
+    def _compat_lazy_initialization(self, key_states, value_states=None):
+        if value_states is None:
+            # The model only passes key_states.  For HunyuanImage-3 the
+            # key and value head dims are identical (head_dim = 128), so
+            # we simply duplicate key_states for shape inference.
+            value_states = key_states
+        return _original_lazy_init(self, key_states, value_states)
+
+    StaticLayer.lazy_initialization = _compat_lazy_initialization  # type: ignore[assignment]
+    _STATIC_CACHE_LAZY_INIT_PATCHED = True
+    logger.info(
+        "Patched StaticLayer.lazy_initialization for transformers >=5.0 compat "
+        "(value_states now optional, derived from key_states when omitted)"
+    )
 
 
 def _ensure_bias_device(module, target_device: torch.device) -> None:
@@ -674,6 +872,7 @@ def ensure_model_on_device(model, device: torch.device, skip_quantized_params: b
     patch_scatter_dtype()
     patch_index_copy_dtype()
     patch_dynamic_cache_dtype()
+    patch_static_cache_lazy_init()
 
     moved_total = 0
     moved_buffers = 0
@@ -1098,15 +1297,108 @@ class HunyuanModelCache:
                     except Exception:
                         pass
 
-                # Try to move to CPU first (helps release CUDA memory)
-                # But catch errors for meta tensors or quantized models
+                # Skip model.cpu() — the tensor gutting below handles everything.
+                # model.cpu() would create ~50GB of new CRT heap allocations
+                # (via block.to('cpu')) that the CRT never returns to the OS,
+                # causing permanent RSS bloat. The tensor gutting that follows
+                # replaces every param.data with empty(0), which frees both
+                # GPU and CPU storage directly.
+                logger.info("  Skipping model.cpu() — tensor gutting handles memory release")
+                
+                # ---- Remove external monkey-patches on submodules ----
+                # Other custom nodes (e.g. seedvr2_videoupscaler) may patch
+                # methods on our model's submodules with closures that
+                # capture the model, keeping the tree alive after unload.
+                import types as _types
+                ext_broken = 0
                 try:
-                    if hasattr(model_to_clear, 'cpu'):
-                        model_to_clear.cpu()
-                except Exception as move_err:
-                    # Meta tensors or quantized models can't be moved
-                    # Just log and continue with deletion
-                    logger.debug("Could not move model to CPU (expected for meta/quantized): %s", move_err)
+                    for _, submod in model_to_clear.named_modules():
+                        for attr_name in list(vars(submod).keys()):
+                            attr = vars(submod).get(attr_name)
+                            if attr is None:
+                                continue
+                            closure = None
+                            if isinstance(attr, _types.FunctionType):
+                                closure = attr.__closure__
+                            elif isinstance(attr, _types.MethodType):
+                                closure = getattr(
+                                    attr.__func__, '__closure__', None)
+                            if closure:
+                                import ctypes as _ct
+                                for cell in closure:
+                                    try:
+                                        _ct.pythonapi.PyCell_Set(
+                                            _ct.py_object(cell),
+                                            _ct.py_object(None))
+                                        ext_broken += 1
+                                    except Exception:
+                                        pass
+                                try:
+                                    delattr(submod, attr_name)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+                if ext_broken:
+                    logger.info("  Broke %d external monkey-patch closure "
+                                "cells on submodules", ext_broken)
+                
+                # ---- Break closure references that keep the model alive ----
+                # patch_hunyuan_generate_image() binds generate_image via
+                # MethodType and patches pipeline_class.__call__.  These
+                # closures hold strong refs to model, preventing gc.
+                # RESTORE originals instead of breaking cells to avoid
+                # corrupting the class for future loads.
+                unpatch_hunyuan_generate_image(model_to_clear)
+                
+                # Unpatch MoE efficient forward — releases the global
+                # _MOE_ORIGINAL_FORWARDS dict which holds bound methods
+                # keeping all MoE expert weights alive in RAM
+                unpatch_moe_efficient_forward(model_to_clear)
+                
+                # Reset dtype hooks flag so they get reinstalled on next load
+                global _DTYPE_HOOKS_INSTALLED
+                _DTYPE_HOOKS_INSTALLED = False
+                
+                # Unpatch VAE decode closure
+                unpatch_pipeline_pre_vae_cleanup(model_to_clear)
+                # ---- End closure unpatching ----
+                
+                # ---- Nuclear gc closure scan ----
+                # Walk ALL gc objects; break any closure cell that still
+                # references this model or one of its submodules.
+                _cell_sentinel = None
+                cell_type = type((lambda: _cell_sentinel).__closure__[0])
+                gc.collect()
+                # Pre-build set of module ids for O(1) lookup
+                model_module_ids = set()
+                try:
+                    for _, _sub in model_to_clear.named_modules():
+                        model_module_ids.add(id(_sub))
+                except Exception:
+                    pass
+                model_module_ids.add(id(model_to_clear))
+                nuked = 0
+                for _obj in gc.get_objects():
+                    if type(_obj) is not cell_type:
+                        continue
+                    try:
+                        _val = _obj.cell_contents
+                    except ValueError:
+                        continue
+                    # CRITICAL: skip class objects (types) — Python stores
+                    # __class__ in a closure cell for super(); breaking it
+                    # destroys super() for the entire class permanently.
+                    if isinstance(_val, torch.nn.Module) and not isinstance(_val, type) and id(_val) in model_module_ids:
+                        import ctypes as _ct
+                        _ct.pythonapi.PyCell_Set(
+                            _ct.py_object(_obj), _ct.py_object(None))
+                        nuked += 1
+                del model_module_ids
+                if nuked:
+                    logger.info(f"  Nuclear closure scan broke {nuked} cells")
+                    gc.collect()
+                # ---- End nuclear gc closure scan ----
                 
                 # Aggressively clear all parameter data
                 try:
@@ -1229,6 +1521,20 @@ class HunyuanImage3Unload:
         
         if force_clear:
             cleared = HunyuanModelCache.clear()
+            
+            # Also clear the Instruct model cache if it exists
+            try:
+                try:
+                    from .hunyuan_instruct_nodes import _instruct_cache
+                except ImportError:
+                    from hunyuan_instruct_nodes import _instruct_cache
+                if _instruct_cache.model is not None:
+                    _instruct_cache.clear()
+                    logger.info("Also cleared Instruct model cache")
+            except ImportError:
+                pass
+            except Exception:
+                pass
         
         # Additional aggressive clearing for downstream models
         if clear_for_downstream:
@@ -1263,6 +1569,10 @@ class HunyuanImage3Unload:
                 logger.info(f"VRAM after unload: {vram_status}")
             except Exception:
                 vram_status = "Could not query VRAM"
+        
+        # Force Windows to return freed memory to OS
+        if force_clear or clear_for_downstream:
+            force_windows_memory_release()
         
         # Return a signal that changes to force downstream nodes to re-evaluate if needed
         return (cleared, vram_status, float(time.time()))
@@ -1516,13 +1826,27 @@ class HunyuanImage3ForceUnload:
             except Exception as e:
                 report_lines.append(f"Could not get initial VRAM: {e}")
         
-        # Step 1: Clear Hunyuan model cache
+        # Step 1: Clear Hunyuan model cache (base AND Instruct)
         if clear_all_models:
             try:
                 cleared = HunyuanModelCache.clear()
-                report_lines.append(f"Hunyuan cache cleared: {cleared}")
+                report_lines.append(f"Hunyuan base cache cleared: {cleared}")
             except Exception as e:
-                report_lines.append(f"Failed to clear Hunyuan cache: {e}")
+                report_lines.append(f"Failed to clear Hunyuan base cache: {e}")
+            
+            # Also clear the Instruct model cache if it exists
+            try:
+                try:
+                    from .hunyuan_instruct_nodes import _instruct_cache
+                except ImportError:
+                    from hunyuan_instruct_nodes import _instruct_cache
+                if _instruct_cache.model is not None:
+                    _instruct_cache.clear()
+                    report_lines.append("Hunyuan Instruct cache cleared")
+            except ImportError:
+                pass  # Instruct nodes not installed
+            except Exception as e:
+                report_lines.append(f"Failed to clear Instruct cache: {e}")
         
         # Step 2: Clear ComfyUI's internal caches (optional, more aggressive)
         if clear_comfy_cache:
@@ -1612,11 +1936,25 @@ class HunyuanImage3ForceUnload:
                 report_lines.append(f"Scanning {len(all_objects)} Python objects...")
                 
                 # First pass: Find and clear nn.Module instances
+                # Build a set of models we want to KEEP (if not clearing them)
+                _skip_models = set()
+                if HunyuanModelCache._cached_model is not None:
+                    _skip_models.add(id(HunyuanModelCache._cached_model))
+                try:
+                    try:
+                        from .hunyuan_instruct_nodes import _instruct_cache
+                    except ImportError:
+                        from hunyuan_instruct_nodes import _instruct_cache
+                    if _instruct_cache.model is not None:
+                        _skip_models.add(id(_instruct_cache.model))
+                except ImportError:
+                    pass
+                
                 for obj in all_objects:
                     try:
                         if isinstance(obj, torch.nn.Module):
-                            # Skip our cached model - we handle that separately
-                            if obj is HunyuanModelCache._cached_model:
+                            # Skip cached models we handle separately
+                            if id(obj) in _skip_models:
                                 continue
                             modules_found += 1
                             # Clear all parameters
@@ -1682,6 +2020,9 @@ class HunyuanImage3ForceUnload:
         # Final GC pass after CUDA cleanup
         if aggressive_gc:
             gc.collect()
+        
+        # Force Windows to return freed memory to OS
+        force_windows_memory_release()
         
         # Get final VRAM state
         vram_after = 0
@@ -2033,6 +2374,9 @@ def patch_hunyuan_generate_image(model):
         return outputs[0]
 
     logger.info("Patching model.generate_image to support progress bars...")
+    # Save original generate_image so we can restore it on unload
+    if not hasattr(model, '_comfy_original_generate_image'):
+        model._comfy_original_generate_image = getattr(model, 'generate_image', None)
     model.generate_image = types.MethodType(new_generate_image, model)
 
     # Also patch the pipeline class to extract callback_on_step_end from model_kwargs
@@ -2042,6 +2386,11 @@ def patch_hunyuan_generate_image(model):
         if not getattr(pipeline_class, '_is_patched_for_comfy', False):
             logger.info("Patching HunyuanImage3Text2ImagePipeline to handle callback_on_step_end...")
             original_call = pipeline_class.__call__
+            # Save the TRUE original on the class so we can restore it on unload.
+            # Only save once — if _comfy_original_call already exists, a previous
+            # unload failed to restore, so keep the earlier (real) original.
+            if not hasattr(pipeline_class, '_comfy_original_call'):
+                pipeline_class._comfy_original_call = original_call
             
             def new_pipeline_call(self, *args, **kwargs):
                 model_kwargs = kwargs.get('model_kwargs')
@@ -2055,6 +2404,59 @@ def patch_hunyuan_generate_image(model):
             
             pipeline_class.__call__ = new_pipeline_call
             pipeline_class._is_patched_for_comfy = True
+
+    # Apply HunyuanStaticCache device harmonization (multi-GPU fix)
+    patch_hunyuan_static_cache_device(model)
+
+
+def unpatch_hunyuan_generate_image(model):
+    """
+    Cleanly reverse all patches applied by patch_hunyuan_generate_image().
+    
+    This RESTORES original methods instead of just breaking closure cells,
+    which is critical for allowing re-patching on the next model load.
+    Breaking closure cells leaves broken wrappers in place that corrupt
+    subsequent loads.
+    """
+    # 1. Restore original generate_image on the model instance
+    if hasattr(model, '_comfy_original_generate_image'):
+        original = model._comfy_original_generate_image
+        if original is not None:
+            model.generate_image = original
+            logger.info("Restored original generate_image method")
+        else:
+            # Original was None (model didn't have generate_image before our patch)
+            try:
+                del model.generate_image
+            except (AttributeError, Exception):
+                pass
+            logger.info("Removed patched generate_image (no original existed)")
+        try:
+            del model._comfy_original_generate_image
+        except (AttributeError, Exception):
+            pass
+    elif hasattr(model, 'generate_image'):
+        # No saved original, but we have a patched generate_image.
+        # Just delete the instance-level override to fall back to class method.
+        try:
+            del model.generate_image
+            logger.info("Removed generate_image instance override (no saved original)")
+        except (AttributeError, Exception):
+            pass
+    
+    # 2. Restore original pipeline class __call__
+    pipeline = getattr(model, 'pipeline', None)
+    if pipeline is not None:
+        pipeline_class = pipeline.__class__
+        if getattr(pipeline_class, '_is_patched_for_comfy', False):
+            if hasattr(pipeline_class, '_comfy_original_call'):
+                pipeline_class.__call__ = pipeline_class._comfy_original_call
+                del pipeline_class._comfy_original_call
+                logger.info("Restored original pipeline __call__")
+            else:
+                # No saved original — just log warning, don't break cells
+                logger.warning("Pipeline patched but no _comfy_original_call saved")
+            pipeline_class._is_patched_for_comfy = False
 
 
 def clear_generation_cache(model) -> None:
@@ -2240,3 +2642,702 @@ def unpatch_pipeline_pre_vae_cleanup(model):
 
     vae._prevae_cleanup_patched = False
     logger.info("Removed pre-VAE cleanup patch")
+
+
+# ---------------------------------------------------------------------------
+# Windows memory release utility
+# ---------------------------------------------------------------------------
+
+def force_windows_memory_release():
+    """Force Windows to return freed memory from the process working set.
+    
+    On Windows, Python's allocator and PyTorch's _aligned_malloc/_aligned_free
+    do NOT return freed memory pages to the OS.  They stay committed in the
+    process working set, making RSS/Task-Manager look inflated even though
+    the memory is logically free inside the CRT heap.
+    
+    This function aggressively tries every available mechanism:
+    1. gc.collect() — break Python reference cycles
+    2. msvcrt._heapmin() — return CRT-heap free blocks to the OS
+    3. GetProcessHeaps + HeapCompact — compact ALL heaps (not just default)
+    4. EmptyWorkingSet — nuclear: evict ALL pages from working set
+    5. SetProcessWorkingSetSizeEx(-1, -1) — trim working set to minimum
+    
+    Call this AFTER all model cleanup (cache.clear, del model, gc.collect,
+    torch.cuda.empty_cache) to reduce the reported RSS.
+    """
+    import gc
+    import sys
+    
+    # Triple gc to break nested cycles
+    gc.collect()
+    gc.collect()
+    gc.collect()
+    
+    if sys.platform != 'win32':
+        return
+    
+    import ctypes
+    import ctypes.wintypes as wintypes
+    
+    ram_before = None
+    try:
+        ram_before = psutil.Process().memory_info().rss / 1024**3
+    except Exception:
+        pass
+    
+    kernel32 = ctypes.windll.kernel32
+    
+    # 1. Ask CRT heap to return free blocks to the OS
+    try:
+        ctypes.cdll.msvcrt._heapmin()
+    except Exception:
+        pass
+    
+    # 2. Compact ALL process heaps (not just default)
+    #    PyTorch and other C libraries may create private heaps.
+    try:
+        GetProcessHeaps = kernel32.GetProcessHeaps
+        GetProcessHeaps.restype = wintypes.DWORD
+        HeapCompact = kernel32.HeapCompact
+        HeapCompact.restype = ctypes.c_size_t
+        
+        # First call to get count
+        num_heaps = GetProcessHeaps(0, None)
+        if num_heaps > 0:
+            heap_array = (wintypes.HANDLE * num_heaps)()
+            got = GetProcessHeaps(num_heaps, heap_array)
+            compacted_total = 0
+            for i in range(got):
+                try:
+                    result = HeapCompact(heap_array[i], 0)
+                    compacted_total += result
+                except Exception:
+                    pass
+            if compacted_total > 0:
+                logger.debug(f"  HeapCompact across {got} heaps: "
+                             f"largest free block sum = "
+                             f"{compacted_total / 1024**2:.1f} MB")
+    except Exception:
+        # Fallback: just compact default heap
+        try:
+            heap = kernel32.GetProcessHeap()
+            kernel32.HeapCompact(heap, 0)
+        except Exception:
+            pass
+    
+    # 3. EmptyWorkingSet — aggressively evicts ALL pages from working set.
+    #    Pages that are truly unused will go to the standby list and the
+    #    OS can reclaim them.  Pages that are still accessed will be
+    #    soft-faulted back in quickly.
+    try:
+        psapi = ctypes.windll.psapi
+        handle = kernel32.GetCurrentProcess()
+        psapi.EmptyWorkingSet(handle)
+    except Exception:
+        try:
+            # EmptyWorkingSet might be in kernel32 on newer Windows
+            handle = kernel32.GetCurrentProcess()
+            kernel32.EmptyWorkingSet(handle)
+        except Exception:
+            pass
+    
+    # 4. SetProcessWorkingSetSizeEx with (-1, -1) — trim to minimum
+    try:
+        handle = kernel32.GetCurrentProcess()
+        SIZE_T = ctypes.c_size_t
+        kernel32.SetProcessWorkingSetSizeEx(
+            handle,
+            SIZE_T(ctypes.c_size_t(-1).value),
+            SIZE_T(ctypes.c_size_t(-1).value),
+            ctypes.c_uint32(0),
+        )
+    except Exception:
+        pass
+    
+    if ram_before is not None:
+        try:
+            ram_after = psutil.Process().memory_info().rss / 1024**3
+            freed = ram_before - ram_after
+            if freed > 0.1:
+                logger.info(f"Windows memory release: freed {freed:.1f}GB "
+                           f"(RSS {ram_before:.1f}GB -> {ram_after:.1f}GB)")
+            else:
+                logger.debug(f"Windows memory release: RSS {ram_after:.1f}GB "
+                            f"(no significant change)")
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# RAM Diagnostic node
+# ---------------------------------------------------------------------------
+
+class HunyuanRAMDiagnostic:
+    """
+    Diagnostic node that reports detailed memory state.
+    
+    Use this to troubleshoot RAM leaks.  It scans all Python objects to find
+    orphaned nn.Module instances and their parameter footprints.  With
+    trace_referrers enabled, it also shows WHO is holding each large module
+    alive (the reference chain), which is the key to finding the actual leak.
+    
+    Run this node BEFORE and AFTER running a cleanup/unload node to see
+    what changed.
+    """
+    
+    CATEGORY = "Hunyuan/Debug"
+    FUNCTION = "diagnose"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("report",)
+    OUTPUT_NODE = True
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "trace_referrers": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Use gc.get_referrers() to trace WHY the largest "
+                               "modules are still alive. SLOW but reveals the leak source."}),
+                "compact_windows_heap": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "After reporting, call Windows APIs to return freed "
+                               "memory to the OS. Only affects reported RSS, not "
+                               "actual leaks."}),
+            },
+        }
+    
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        """Always re-run so the report is fresh."""
+        return float("NaN")
+    
+    def diagnose(self, trace_referrers: bool = False,
+                 compact_windows_heap: bool = True):
+        import gc
+        import sys
+        import torch.nn as nn
+        from collections import defaultdict
+        
+        lines = []
+        proc = psutil.Process()
+        rss = proc.memory_info().rss / 1024**3
+        vm = psutil.virtual_memory()
+        lines.append("=" * 60)
+        lines.append("          HUNYUAN RAM DIAGNOSTIC REPORT")
+        lines.append("=" * 60)
+        lines.append(f"Process RSS:   {rss:.2f} GB")
+        lines.append(f"System RAM:    {vm.used / 1024**3:.1f}GB used / "
+                     f"{vm.total / 1024**3:.1f}GB total ({vm.percent}%)")
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                free_b, total_b = torch.cuda.mem_get_info(i)
+                alloc_b = torch.cuda.memory_allocated(i)
+                lines.append(f"GPU {i}:         {alloc_b/1024**3:.1f}GB alloc, "
+                             f"{free_b/1024**3:.1f}GB free / "
+                             f"{total_b/1024**3:.1f}GB total")
+        lines.append("")
+        
+        # ------------------------------------------------------------------
+        # Scan all gc objects for nn.Module and raw Tensor instances
+        # ------------------------------------------------------------------
+        gc.collect()
+        all_objects = gc.get_objects()
+        
+        module_types = defaultdict(lambda: {"count": 0, "cpu_bytes": 0,
+                                            "cuda_bytes": 0})
+        total_cpu_bytes = 0
+        total_cuda_bytes = 0
+        module_count = 0
+        tensor_count = 0
+        tensor_cpu_bytes = 0
+        tensor_cuda_bytes = 0
+        
+        # For referrer tracing: keep references to the biggest modules
+        largest_modules = []  # (bytes, type_name, obj_or_None)
+        
+        for obj in all_objects:
+            try:
+                if isinstance(obj, nn.Module):
+                    module_count += 1
+                    type_name = type(obj).__qualname__
+                    mod_cpu = 0
+                    mod_cuda = 0
+                    # recurse=False avoids double-counting child modules
+                    for p in obj.parameters(recurse=False):
+                        nb = p.numel() * p.element_size()
+                        if p.device.type == "cpu":
+                            mod_cpu += nb
+                        else:
+                            mod_cuda += nb
+                    for b in obj.buffers(recurse=False):
+                        nb = b.numel() * b.element_size()
+                        if b.device.type == "cpu":
+                            mod_cpu += nb
+                        else:
+                            mod_cuda += nb
+                    module_types[type_name]["count"] += 1
+                    module_types[type_name]["cpu_bytes"] += mod_cpu
+                    module_types[type_name]["cuda_bytes"] += mod_cuda
+                    total_cpu_bytes += mod_cpu
+                    total_cuda_bytes += mod_cuda
+                    mod_total = mod_cpu + mod_cuda
+                    if mod_total > 0:
+                        largest_modules.append(
+                            (mod_total, type_name,
+                             obj if trace_referrers else None))
+                elif isinstance(obj, torch.Tensor) and not isinstance(obj, nn.Parameter):
+                    tensor_count += 1
+                    nb = obj.numel() * obj.element_size()
+                    if obj.device.type == "cpu":
+                        tensor_cpu_bytes += nb
+                    else:
+                        tensor_cuda_bytes += nb
+            except Exception:
+                continue
+        
+        del all_objects  # release the huge list ASAP
+        
+        lines.append(f"nn.Module instances alive:  {module_count}")
+        lines.append(f"  CPU parameter bytes:      {total_cpu_bytes / 1024**3:.2f} GB")
+        lines.append(f"  CUDA parameter bytes:     {total_cuda_bytes / 1024**3:.2f} GB")
+        lines.append(f"Raw Tensors (non-Param):    {tensor_count}")
+        lines.append(f"  CPU tensor bytes:         {tensor_cpu_bytes / 1024**3:.2f} GB")
+        lines.append(f"  CUDA tensor bytes:        {tensor_cuda_bytes / 1024**3:.2f} GB")
+        lines.append("")
+        
+        # Top-10 module types by parameter size
+        sorted_types = sorted(
+            module_types.items(),
+            key=lambda x: x[1]["cpu_bytes"] + x[1]["cuda_bytes"],
+            reverse=True,
+        )[:15]
+        lines.append("Top module types by parameter size:")
+        lines.append(f"  {'Type':<45} {'Count':>5}  {'CPU GB':>8}  {'CUDA GB':>8}")
+        lines.append("  " + "-" * 70)
+        for type_name, info in sorted_types:
+            cpu_gb = info["cpu_bytes"] / 1024**3
+            cuda_gb = info["cuda_bytes"] / 1024**3
+            if cpu_gb + cuda_gb < 0.001:
+                continue
+            # Truncate long names
+            short = type_name[-44:] if len(type_name) > 44 else type_name
+            lines.append(f"  {short:<45} {info['count']:>5}  "
+                         f"{cpu_gb:>8.3f}  {cuda_gb:>8.3f}")
+        lines.append("")
+        
+        # ------------------------------------------------------------------
+        # Comprehensive tensor STORAGE scan
+        #
+        # The module-parameter scan above only counts parameters owned by
+        # live nn.Module objects.  But RSS can be much higher if there are:
+        #   1. Tensor storages shared between multiple tensors (views)
+        #   2. Oversized storages (tensor is a slice of a big storage)
+        #   3. Tensors held by dicts/lists/closures not attached to modules
+        #   4. Memory-mapped file pages still mapped
+        #
+        # This section deduplicates by storage data_ptr() to give the
+        # TRUE memory footprint, and categorises by owner type.
+        # ------------------------------------------------------------------
+        lines.append("--- Tensor Storage Analysis (unique storages) ---")
+        gc.collect()
+        seen_ptrs = {}  # data_ptr -> (nbytes, device_type, owner_desc)
+        all_objs = gc.get_objects()
+        
+        for obj in all_objs:
+            try:
+                if not isinstance(obj, torch.Tensor):
+                    continue
+                storage = obj.untyped_storage()
+                dptr = storage.data_ptr()
+                nbytes = storage.nbytes()
+                if nbytes == 0:
+                    continue
+                dev = str(obj.device)
+                if dptr not in seen_ptrs or nbytes > seen_ptrs[dptr][0]:
+                    # Classify the tensor's owner
+                    if isinstance(obj, nn.Parameter):
+                        owner = "nn.Parameter"
+                    else:
+                        owner = "Tensor"
+                    seen_ptrs[dptr] = (nbytes, dev, owner)
+            except Exception:
+                continue
+        
+        # Also scan for mmap-backed file handles
+        mmap_count = 0
+        mmap_bytes = 0
+        try:
+            import mmap as _mmap_mod
+            for obj in all_objs:
+                if isinstance(obj, _mmap_mod.mmap):
+                    mmap_count += 1
+                    try:
+                        mmap_bytes += obj.size()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        
+        del all_objs
+        
+        # Aggregate by device
+        storage_summary = {}  # device -> (count, total_bytes)
+        for dptr, (nbytes, dev, owner) in seen_ptrs.items():
+            if dev not in storage_summary:
+                storage_summary[dev] = [0, 0]
+            storage_summary[dev][0] += 1
+            storage_summary[dev][1] += nbytes
+        
+        total_storage_gb = sum(v[1] for v in storage_summary.values()) / 1024**3
+        lines.append(f"  Unique tensor storages: {len(seen_ptrs)} "
+                     f"({total_storage_gb:.2f} GB total)")
+        for dev in sorted(storage_summary.keys()):
+            cnt, nbytes = storage_summary[dev]
+            lines.append(f"    {dev}: {cnt} storages, "
+                         f"{nbytes / 1024**3:.2f} GB")
+        
+        if mmap_count > 0:
+            lines.append(f"  Memory-mapped files: {mmap_count} "
+                         f"({mmap_bytes / 1024**3:.2f} GB)")
+        
+        # Show top-10 largest individual storages
+        top_storages = sorted(seen_ptrs.values(),
+                              key=lambda x: x[0], reverse=True)[:10]
+        if top_storages:
+            lines.append("  Top-10 largest tensor storages:")
+            for i, (nbytes, dev, owner) in enumerate(top_storages):
+                lines.append(f"    [{i}] {nbytes / 1024**3:.3f} GB on "
+                             f"{dev} ({owner})")
+        
+        # Gap analysis: RSS vs tracked memory
+        tracked_gb = total_storage_gb + (mmap_bytes / 1024**3)
+        gap_gb = rss - tracked_gb
+        lines.append(f"\n  RSS: {rss:.2f} GB | Tracked: {tracked_gb:.2f} GB | "
+                     f"Gap: {gap_gb:.2f} GB")
+        if gap_gb > 5.0:
+            lines.append(f"  ⚠ {gap_gb:.1f}GB unaccounted: likely Python heap, "
+                         f"mmap pages, or C-level allocations")
+        
+        del seen_ptrs
+        lines.append("")
+        
+        # ------------------------------------------------------------------
+        # Reference tracing for the largest individual modules
+        # ------------------------------------------------------------------
+        if trace_referrers and largest_modules:
+            largest_modules.sort(reverse=True, key=lambda x: x[0])
+            
+            # Extract just the objects into a separate list to avoid our
+            # own tuples showing up as referrers
+            trace_targets = [(m[0], m[1], m[2]) for m in largest_modules[:5]
+                             if m[2] is not None]
+            # Now clear our tuples so they don't pollute get_referrers()
+            largest_modules.clear()
+            
+            lines.append("=" * 60)
+            lines.append("  REFERRER TRACE (top-5 largest modules)")
+            lines.append("=" * 60)
+            
+            for mod_bytes, type_name, obj in trace_targets:
+                lines.append(f"\n  {type_name} ({mod_bytes / 1024**3:.2f} GB):")
+                if obj is None:
+                    lines.append("    (skipped — trace_referrers was False)")
+                    continue
+                try:
+                    referrers = gc.get_referrers(obj)
+                    lines.append(f"    {len(referrers)} referrers:")
+                    for i, ref in enumerate(referrers[:10]):
+                        ref_type = type(ref).__name__
+                        if isinstance(ref, dict):
+                            keys = [k for k, v in ref.items()
+                                    if v is obj][:3]
+                            # Who owns this dict?
+                            owners = gc.get_referrers(ref)
+                            owner_types = []
+                            for o in owners[:4]:
+                                if o is not ref and not isinstance(o, list):
+                                    oname = type(o).__qualname__
+                                    owner_types.append(oname)
+                            lines.append(
+                                f"    [{i}] dict(keys={keys}) "
+                                f"owned by: {owner_types}")
+                            del owners
+                        elif ref_type == 'cell':
+                            # A closure cell — find which function owns it
+                            cell_id = id(ref)
+                            owner_func = "(unknown)"
+                            cell_val_type = "(unreadable)"
+                            try:
+                                cell_val = ref.cell_contents
+                                cell_val_type = type(cell_val).__qualname__
+                            except ValueError:
+                                cell_val_type = "(empty cell)"
+                            except Exception:
+                                pass
+                            try:
+                                # Search gc objects for function owning this cell
+                                # Check plain functions AND MethodType.__func__
+                                import types as _types
+                                for scan_obj in gc.get_objects():
+                                    closure = None
+                                    if isinstance(scan_obj, _types.FunctionType):
+                                        closure = scan_obj.__closure__
+                                    elif isinstance(scan_obj, _types.MethodType):
+                                        func = scan_obj.__func__
+                                        if hasattr(func, '__closure__'):
+                                            closure = func.__closure__
+                                    elif hasattr(scan_obj, '__wrapped__'):
+                                        # functools.wraps etc
+                                        w = scan_obj.__wrapped__
+                                        if hasattr(w, '__closure__'):
+                                            closure = w.__closure__
+                                    if closure and any(
+                                            id(c) == cell_id for c in closure):
+                                        qn = getattr(scan_obj, '__qualname__',
+                                                      getattr(scan_obj, '__name__', '?'))
+                                        mod = getattr(scan_obj, '__module__', '?')
+                                        owner_func = f"{mod}.{qn}"
+                                        break
+                            except Exception:
+                                pass
+                            lines.append(
+                                f"    [{i}] CLOSURE CELL id={cell_id:#x} "
+                                f"contains={cell_val_type} "
+                                f"owner: {owner_func}")
+                        elif isinstance(ref, (list, tuple)):
+                            idx = next(
+                                (j for j, item in enumerate(ref)
+                                 if item is obj), "?")
+                            lines.append(
+                                f"    [{i}] {ref_type}[{idx}] "
+                                f"(len={len(ref)})")
+                        elif isinstance(ref, nn.Module):
+                            lines.append(
+                                f"    [{i}] {type(ref).__qualname__} "
+                                f"(parent module)")
+                        else:
+                            r = repr(ref)[:120]
+                            lines.append(
+                                f"    [{i}] {ref_type}: {r}")
+                    del referrers
+                except Exception as e:
+                    lines.append(f"    Error tracing: {e}")
+            # Clean up trace targets
+            del trace_targets
+            lines.append("")
+        
+        # Clear our own references to the objects
+        largest_modules.clear()
+        del largest_modules
+        
+        # ------------------------------------------------------------------
+        # Closure cell scan: find ALL cells holding nn.Module references
+        # This directly identifies the leak source regardless of cell owner
+        # ------------------------------------------------------------------
+        if trace_referrers:
+            lines.append("=" * 60)
+            lines.append("  ALL CLOSURE CELLS HOLDING nn.Module OBJECTS")
+            lines.append("=" * 60)
+            import types as _types
+            gc.collect()
+            _cell_sentinel_diag = None
+            cell_type = type((lambda: _cell_sentinel_diag).__closure__[0])
+            cell_count = 0
+            for obj in gc.get_objects():
+                if type(obj) is not cell_type:
+                    continue
+                try:
+                    val = obj.cell_contents
+                except ValueError:
+                    continue
+                if not isinstance(val, nn.Module):
+                    continue
+                cell_count += 1
+                cell_id = id(obj)
+                val_type = type(val).__qualname__
+                # Count parameters in this module
+                try:
+                    param_bytes = sum(
+                        p.numel() * p.element_size()
+                        for p in val.parameters())
+                    param_gb = param_bytes / 1024**3
+                except Exception:
+                    param_gb = 0
+                
+                # Find owner function
+                owner = "(orphaned cell — no function owns it)"
+                for scan_obj in gc.get_objects():
+                    closure = None
+                    if isinstance(scan_obj, _types.FunctionType):
+                        closure = scan_obj.__closure__
+                    elif isinstance(scan_obj, _types.MethodType):
+                        func = scan_obj.__func__
+                        if hasattr(func, '__closure__'):
+                            closure = func.__closure__
+                    if closure and any(id(c) == cell_id for c in closure):
+                        qn = getattr(scan_obj, '__qualname__',
+                                     getattr(scan_obj, '__name__', '?'))
+                        mod = getattr(scan_obj, '__module__', '?')
+                        owner = f"{mod}.{qn}"
+                        break
+                
+                lines.append(f"  Cell {cell_id:#x}: contains {val_type} "
+                             f"({param_gb:.2f}GB), owner: {owner}")
+                
+                # If owner is orphaned, find what keeps the CELL alive
+                if "orphaned" in owner:
+                    cell_referrers = gc.get_referrers(obj)
+                    for ci, cref in enumerate(cell_referrers[:5]):
+                        ct = type(cref).__name__
+                        if isinstance(cref, tuple):
+                            # A tuple of cells = a __closure__ tuple
+                            # Find who owns THAT tuple
+                            tuple_refs = gc.get_referrers(cref)
+                            tuple_owners = []
+                            for tr in tuple_refs[:5]:
+                                if tr is not cref:
+                                    tn = type(tr).__qualname__
+                                    if hasattr(tr, '__qualname__'):
+                                        tn = f"{tr.__module__}.{tr.__qualname__}"
+                                    tuple_owners.append(tn)
+                            del tuple_refs
+                            lines.append(f"    cell-ref[{ci}]: tuple "
+                                         f"(closure tuple) owners: {tuple_owners}")
+                        else:
+                            lines.append(f"    cell-ref[{ci}]: {ct}")
+                    del cell_referrers
+            
+            if cell_count == 0:
+                lines.append("  No closure cells holding nn.Module objects found")
+            lines.append("")
+        
+        # ------------------------------------------------------------------
+        # ComfyUI model management inspection
+        # ------------------------------------------------------------------
+        lines.append("--- ComfyUI Model Management ---")
+        try:
+            import comfy.model_management as mm
+            models = mm.current_loaded_models
+            lines.append(f"ModelPatcher loaded models: {len(models)}")
+            for m in models:
+                try:
+                    mem_gb = m.model_memory() / 1024**3
+                    lines.append(f"  {type(m.model).__name__}: {mem_gb:.2f}GB")
+                except Exception:
+                    lines.append(f"  {type(m).__name__}: (size unknown)")
+        except Exception as e:
+            lines.append(f"  Could not inspect: {e}")
+        
+        # Our custom caches
+        lines.append("")
+        lines.append("--- Hunyuan Custom Caches ---")
+        try:
+            if HunyuanModelCache._cached_model is not None:
+                m = HunyuanModelCache._cached_model
+                lines.append(f"Base cache: {type(m).__name__} "
+                             f"(refcount={sys.getrefcount(m)})")
+            else:
+                lines.append("Base cache: empty")
+        except Exception:
+            lines.append("Base cache: (error)")
+        
+        try:
+            from .hunyuan_instruct_nodes import _instruct_cache
+            if _instruct_cache.model is not None:
+                m = _instruct_cache.model
+                lines.append(f"Instruct cache: {type(m).__name__} "
+                             f"(refcount={sys.getrefcount(m)})")
+            else:
+                lines.append("Instruct cache: empty")
+        except Exception:
+            try:
+                from hunyuan_instruct_nodes import _instruct_cache
+                if _instruct_cache.model is not None:
+                    m = _instruct_cache.model
+                    lines.append(f"Instruct cache: {type(m).__name__} "
+                                 f"(refcount={sys.getrefcount(m)})")
+                else:
+                    lines.append("Instruct cache: empty")
+            except Exception:
+                lines.append("Instruct cache: (not loaded)")
+        
+        try:
+            from .hunyuan_cache_v2 import get_cache
+            v2_status = get_cache().get_status()
+            if v2_status.get("cached"):
+                lines.append(f"V2 cache: {v2_status['quant_type']} model "
+                             f"(on_gpu={v2_status['is_on_gpu']})")
+            else:
+                lines.append("V2 cache: empty")
+        except Exception:
+            try:
+                from hunyuan_cache_v2 import get_cache
+                v2_status = get_cache().get_status()
+                if v2_status.get("cached"):
+                    lines.append(f"V2 cache: {v2_status['quant_type']} model "
+                                 f"(on_gpu={v2_status['is_on_gpu']})")
+                else:
+                    lines.append("V2 cache: empty")
+            except Exception:
+                lines.append("V2 cache: (not loaded)")
+        
+        lines.append("")
+        
+        # ------------------------------------------------------------------
+        # Open file handles — mmap'd safetensors files keep pages in RSS
+        # ------------------------------------------------------------------
+        lines.append("--- Open File Handles (model-related) ---")
+        try:
+            open_files = proc.open_files()
+            model_files = [f for f in open_files
+                           if any(ext in f.path.lower()
+                                  for ext in ('.safetensors', '.bin', '.pt',
+                                              '.pth', '.gguf', '.onnx'))]
+            if model_files:
+                lines.append(f"  {len(model_files)} model file(s) still open:")
+                for f in model_files[:20]:
+                    lines.append(f"    {f.path}")
+            else:
+                lines.append("  No model files open")
+            lines.append(f"  Total open files: {len(open_files)}")
+        except Exception as e:
+            lines.append(f"  Could not inspect: {e}")
+        lines.append("")
+        
+        # ------------------------------------------------------------------
+        # Optional: Compact Windows heap
+        # ------------------------------------------------------------------
+        if compact_windows_heap:
+            rss_before = proc.memory_info().rss / 1024**3
+            force_windows_memory_release()
+            rss_after = proc.memory_info().rss / 1024**3
+            freed = rss_before - rss_after
+            lines.append(f"Windows heap compact + EmptyWorkingSet: "
+                         f"RSS {rss_before:.2f}GB -> {rss_after:.2f}GB "
+                         f"(freed {freed:.2f}GB)")
+            if freed < 0.5:
+                lines.append("  -> Minimal change. The committed virtual memory "
+                             "is held by the C runtime heap (CRT) due to")
+                lines.append("     heap fragmentation from large PyTorch "
+                             "allocations during generation.")
+                lines.append("     This memory CANNOT be returned to the OS "
+                             "without restarting the process.")
+                lines.append("     It IS reusable by the process for the next "
+                             "model load (no new allocation needed).")
+            else:
+                lines.append("  -> Pages evicted from working set. RSS dropped "
+                             "but commit charge may still be high.")
+                lines.append("     The OS can repurpose the physical RAM for "
+                             "other processes.")
+        
+        lines.append("")
+        lines.append("=" * 60)
+        
+        report = "\n".join(lines)
+        # Print to ComfyUI console as well
+        for line in lines:
+            logger.info(line)
+        
+        return (report,)

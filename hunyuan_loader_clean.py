@@ -11,10 +11,11 @@ Copyright (c) 2025 Eric Hiss. All rights reserved.
 import gc
 import logging
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 import torch
+from torch import nn
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,89 @@ class LoadResult:
         moveable = "moveable" if self.is_moveable else "fixed"
         device_map_str = " (device_map)" if self.uses_device_map else ""
         return f"LoadResult({self.quant_type}, {self.device}, {moveable}{device_map_str})"
+
+
+# ---------------------------------------------------------------------------
+# Helper: move non-block components to GPU (for block-swap loading)
+# ---------------------------------------------------------------------------
+
+def _move_non_block_components_to_gpu(
+    model: Any,
+    target_device: torch.device,
+    verbose: int = 1,
+) -> float:
+    """Move all non-transformer-block components of a Hunyuan model to GPU.
+
+    After loading with ``device_map="cpu"``, this function moves the
+    embedding, vision, timestep, patch, final, and head components to GPU
+    while leaving the 32 transformer blocks (``model.model.layers``) on CPU
+    for :class:`BlockSwapManager`.
+
+    The model structure is::
+
+        HunyuanImage3ForCausalMM
+          .vae                  – VAE encoder/decoder
+          .vision_model         – Siglip2 vision transformer
+          .vision_aligner       – LightProjector
+          .timestep_emb         – Timestep embedding
+          .guidance_emb         – Guidance embedding (CFG-distilled)
+          .timestep_r_emb       – Meanflow timestep embedding
+          .patch_embed          – Patch embedding (UNetDown)
+          .time_embed           – Time embedding
+          .time_embed_2         – Time embedding 2
+          .final_layer          – Output projection (UNetUp)
+          .model.wte            – Word token embedding
+          .model.layers[0..31]  – 32 transformer blocks (LEFT ON CPU)
+          .model.ln_f           – Final layer norm
+          .lm_head              – Language model head
+
+    Returns:
+        Total GB moved to GPU.
+    """
+    total_bytes = 0
+
+    # Top-level components on the ForCausalMM wrapper
+    top_level = [
+        "vae", "vision_model", "vision_aligner",
+        "timestep_emb", "guidance_emb", "timestep_r_emb",
+        "patch_embed", "time_embed", "time_embed_2",
+        "final_layer",
+        "cached_rope",
+    ]
+    for name in top_level:
+        comp = getattr(model, name, None)
+        if comp is not None and hasattr(comp, "to"):
+            size = sum(p.numel() * p.element_size() for p in comp.parameters()) if hasattr(comp, "parameters") else 0
+            comp.to(target_device)
+            total_bytes += size
+            if verbose >= 2:
+                logger.info(f"  Moved {name} to {target_device} ({size / 1024**3:.2f}GB)")
+
+    # Inner model components (skip layers — those are for BlockSwapManager)
+    inner = getattr(model, "model", None)
+    if inner is not None:
+        for name in ("wte", "ln_f"):
+            comp = getattr(inner, name, None)
+            if comp is not None and hasattr(comp, "to"):
+                size = sum(p.numel() * p.element_size() for p in comp.parameters()) if hasattr(comp, "parameters") else 0
+                comp.to(target_device)
+                total_bytes += size
+                if verbose >= 2:
+                    logger.info(f"  Moved model.{name} to {target_device} ({size / 1024**3:.2f}GB)")
+
+    # lm_head
+    lm_head = getattr(model, "lm_head", None)
+    if lm_head is not None and hasattr(lm_head, "to"):
+        size = sum(p.numel() * p.element_size() for p in lm_head.parameters()) if hasattr(lm_head, "parameters") else 0
+        lm_head.to(target_device)
+        total_bytes += size
+        if verbose >= 2:
+            logger.info(f"  Moved lm_head to {target_device} ({size / 1024**3:.2f}GB)")
+
+    total_gb = total_bytes / 1024**3
+    if verbose >= 1:
+        logger.info(f"  Moved non-block components to {target_device}: {total_gb:.2f}GB total")
+    return total_gb
 
 
 class CleanModelLoader:
@@ -91,6 +175,7 @@ class CleanModelLoader:
         device: str = "cuda:0",
         dtype: torch.dtype = torch.bfloat16,
         reserve_vram_gb: float = 0.0,
+        blocks_to_swap: int = 0,
     ) -> LoadResult:
         """
         Load a model with specified quantization.
@@ -101,6 +186,8 @@ class CleanModelLoader:
             device: Target device (e.g., "cuda:0")
             dtype: Compute dtype for non-quantized layers
             reserve_vram_gb: VRAM to reserve for inference (BF16 only)
+            blocks_to_swap: Number of blocks to swap (>0 enables CPU-offload
+                block-swap loading for BF16 instead of device_map="auto")
             
         Returns:
             LoadResult with loaded model
@@ -111,7 +198,10 @@ class CleanModelLoader:
         quant_type = quant_type.lower()
         
         if quant_type == "bf16":
-            result = cls._load_bf16(model_path, device, dtype, reserve_vram_gb)
+            if blocks_to_swap > 0:
+                result = cls._load_bf16_block_swap(model_path, device, dtype)
+            else:
+                result = cls._load_bf16(model_path, device, dtype, reserve_vram_gb)
         elif quant_type == "nf4":
             result = cls._load_nf4(model_path, device, dtype)
         elif quant_type == "int8":
@@ -364,6 +454,104 @@ class CleanModelLoader:
         )
     
     @classmethod
+    def _load_bf16_block_swap(
+        cls,
+        model_path: str,
+        device: str,
+        dtype: torch.dtype,
+    ) -> LoadResult:
+        """
+        Load BF16 model to CPU, then move non-block components to GPU.
+
+        This avoids ``device_map="auto"`` and accelerate's ``AlignDevicesHook``
+        entirely.  Instead the 32 transformer blocks stay on CPU and are
+        swapped to GPU on-the-fly by :class:`BlockSwapManager` (installed by
+        the caller).  Non-block components (VAE, embeddings, projections) are
+        moved to GPU here so they are always resident.
+
+        This is the same strategy used by the Instruct loader and yields
+        *much* faster generation than ``device_map="auto"`` because blocks
+        only need a single GPU↔CPU copy instead of the hook-based
+        materialise-compute-evict cycle that accelerate performs.
+
+        Returns a ``LoadResult`` with ``is_moveable=True`` (blocks can be
+        freely moved between GPU and CPU).
+        """
+        logger.info(f"Loading BF16 model from {model_path} (block-swap mode)")
+        logger.info("BF16 model (~160GB) → CPU first, then non-block parts to GPU")
+        logger.info("Transformer blocks will be managed by BlockSwapManager")
+
+        # Clear CUDA cache before loading
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        # Log system RAM availability
+        try:
+            import psutil
+            ram = psutil.virtual_memory()
+            logger.info(
+                f"System RAM: {ram.available / 1024**3:.1f}GB available / "
+                f"{ram.total / 1024**3:.1f}GB total ({ram.percent:.1f}% used)"
+            )
+        except ImportError:
+            pass
+
+        # Load entirely to CPU  ────────────────────────────────────────────
+        logger.info("Loading model to CPU (low_cpu_mem_usage=True)...")
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map="cpu",
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+                moe_impl="eager",
+                moe_drop_tokens=True,
+                low_cpu_mem_usage=True,
+            )
+        except TypeError:
+            # Fallback for older transformers that don't support all kwargs
+            logger.warning("Falling back to minimal load args")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map="cpu",
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+            )
+
+        # Move non-block components to GPU  ────────────────────────────────
+        target = torch.device(device)
+        moved_gb = _move_non_block_components_to_gpu(model, target)
+        logger.info(f"Moved {moved_gb:.2f}GB of non-block components to {device}")
+
+        # Remove stale hf_device_map (we manage placement ourselves now)
+        if hasattr(model, "hf_device_map"):
+            delattr(model, "hf_device_map")
+
+        # Remove any accelerate dispatch hooks installed by device_map="cpu"
+        try:
+            from accelerate.hooks import remove_hook_from_module
+            for _name, module in model.named_modules():
+                if hasattr(module, "_hf_hook"):
+                    remove_hook_from_module(module)
+        except (ImportError, Exception):
+            pass
+
+        logger.info("BF16 model ready for block-swap inference")
+
+        return LoadResult(
+            model=model,
+            quant_type="bf16",
+            is_moveable=True,  # Blocks can be freely moved GPU↔CPU
+            device=device,
+            dtype=torch.bfloat16,
+            load_time_seconds=0.0,
+            uses_device_map=False,
+        )
+
+    @classmethod
     def _load_nf4(
         cls,
         model_path: str,
@@ -584,10 +772,12 @@ def apply_model_patches(model: Any) -> None:
         patch_dynamic_cache_dtype,
         patch_hunyuan_generate_image,
         patch_pipeline_pre_vae_cleanup,
+        patch_static_cache_lazy_init,
     )
     
     # Apply dtype patches
     patch_dynamic_cache_dtype()
+    patch_static_cache_lazy_init()
     
     # Apply generation patches
     patch_hunyuan_generate_image(model)

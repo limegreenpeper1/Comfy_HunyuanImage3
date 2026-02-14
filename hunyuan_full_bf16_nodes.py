@@ -36,6 +36,7 @@ from .hunyuan_shared import (
     get_available_hunyuan_models,
     patch_dynamic_cache_dtype,
     patch_hunyuan_generate_image,
+    patch_static_cache_lazy_init,
     resolve_hunyuan_model_path,
 )
 
@@ -350,6 +351,7 @@ class HunyuanImage3FullLoader:
     def _apply_dtype_patches(cls):
         logger.info("Applying dtype compatibility patches...")
         patch_dynamic_cache_dtype()
+        patch_static_cache_lazy_init()
 
 
 NODE_CLASS_MAPPINGS = {
@@ -555,6 +557,7 @@ class HunyuanImage3FullGPULoader:
     def _apply_dtype_patches(cls):
         logger.info("Applying dtype compatibility patches...")
         patch_dynamic_cache_dtype()
+        patch_static_cache_lazy_init()
 
 
 NODE_CLASS_MAPPINGS.update({
@@ -838,6 +841,7 @@ class HunyuanImage3DualGPULoader:
     def _apply_dtype_patches(cls):
         logger.info("Applying dtype compatibility patches...")
         patch_dynamic_cache_dtype()
+        patch_static_cache_lazy_init()
 
 
 NODE_CLASS_MAPPINGS.update({
@@ -944,6 +948,7 @@ class HunyuanImage3SingleGPU88GB:
                 if HunyuanModelCache.restore_to_gpu():
                     logger.info("✓ Model restored from CPU to GPU")
                     patch_dynamic_cache_dtype()
+                    patch_static_cache_lazy_init()
                     patch_hunyuan_generate_image(cached)
                     return (cached,)
                 else:
@@ -953,6 +958,7 @@ class HunyuanImage3SingleGPU88GB:
             else:
                 logger.info("Using cached model")
                 patch_dynamic_cache_dtype()
+                patch_static_cache_lazy_init()
                 patch_hunyuan_generate_image(cached)
                 ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=False)
                 return (cached,)
@@ -1004,6 +1010,7 @@ class HunyuanImage3SingleGPU88GB:
 
             logger.info("Applying dtype compatibility patches...")
             patch_dynamic_cache_dtype()
+            patch_static_cache_lazy_init()
             patch_hunyuan_generate_image(model)
 
             logger.info("Verifying device placement...")

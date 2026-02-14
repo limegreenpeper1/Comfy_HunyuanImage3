@@ -10,6 +10,7 @@ Copyright (c) 2025 Eric Hiss. All rights reserved.
 """
 
 import logging
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -360,28 +361,451 @@ class ModelCacheV2:
                 return True
     
     def _unload_entry(self, key: str):
-        """Unload a single cache entry (internal, must hold lock)."""
+        """Unload a single cache entry (internal, must hold lock).
+        
+        Carefully breaks all circular references before deleting the model
+        to ensure RAM is actually freed. Without this, BlockSwapManager's
+        references to model and model.model.layers[] keep ~80GB+ of
+        transformer block tensors alive in system RAM.
+        """
         if key not in self._cache:
             return
         
         cached = self._cache[key]
         
-        # Clean up managers
-        if cached.block_swap_manager:
-            del cached.block_swap_manager
-        if cached.vae_manager:
-            del cached.vae_manager
+        # Track RAM before cleanup
+        try:
+            import psutil
+            ram_before = psutil.Process().memory_info().rss / 1024**3
+        except ImportError:
+            ram_before = None
         
-        # Delete model
+        # Step 1: Clean up BlockSwapManager (MUST happen before del model)
+        # cleanup() removes hooks, clears blocks list, nulls model ref
+        if cached.block_swap_manager:
+            if hasattr(cached.block_swap_manager, 'cleanup'):
+                cached.block_swap_manager.cleanup()
+            elif hasattr(cached.block_swap_manager, 'remove_hooks'):
+                if cached.block_swap_manager.hooks_installed:
+                    cached.block_swap_manager.remove_hooks()
+            cached.block_swap_manager = None
+        
+        # Step 2: VAE manager
+        if hasattr(cached, 'vae_manager') and cached.vae_manager is not None:
+            if hasattr(cached.vae_manager, 'cleanup'):
+                cached.vae_manager.cleanup()
+            cached.vae_manager = None
+        
+        # Step 3: Unpatch VAE decode closure (holds ref to model)
+        logger.info("  Step 3: Unpatching VAE decode closure...")
+        if cached.model is not None:
+            try:
+                from .hunyuan_shared import unpatch_pipeline_pre_vae_cleanup
+                unpatch_pipeline_pre_vae_cleanup(cached.model)
+                logger.info("    Done: VAE decode closure unpatched")
+            except ImportError:
+                try:
+                    from hunyuan_shared import unpatch_pipeline_pre_vae_cleanup
+                    unpatch_pipeline_pre_vae_cleanup(cached.model)
+                    logger.info("    Done: VAE decode closure unpatched (alt import)")
+                except ImportError:
+                    logger.info("    Skipped: unpatch_pipeline_pre_vae_cleanup not importable")
+            except Exception as e:
+                logger.warning(f"    Error unpatching VAE: {e}")
+        
+        # Step 4: Clear generation caches (KV cache, etc.)
+        if cached.model is not None:
+            try:
+                from .hunyuan_shared import clear_generation_cache
+                clear_generation_cache(cached.model)
+            except ImportError:
+                try:
+                    from hunyuan_shared import clear_generation_cache
+                    clear_generation_cache(cached.model)
+                except ImportError:
+                    pass
+            except Exception:
+                pass
+
+        # Step 4b: Unpatch MoE efficient forward (releases _MOE_ORIGINAL_FORWARDS global dict)
+        if cached.model is not None:
+            try:
+                try:
+                    from .hunyuan_shared import unpatch_moe_efficient_forward
+                except ImportError:
+                    from hunyuan_shared import unpatch_moe_efficient_forward
+                unpatch_moe_efficient_forward(cached.model)
+                logger.info("  Step 4b: Unpatched MoE efficient forward")
+            except ImportError:
+                logger.info("  Step 4b: unpatch_moe_efficient_forward not available")
+            except Exception as e:
+                logger.warning(f"  Step 4b: Error unpatching MoE: {e}")
+        
+        # Step 4c: Reset dtype hooks flag so they get reinstalled on next load
+        try:
+            import sys
+            _mod = sys.modules.get('hunyuan_shared') or sys.modules.get(__package__ + '.hunyuan_shared' if __package__ else 'hunyuan_shared')
+            if _mod is not None:
+                _mod._DTYPE_HOOKS_INSTALLED = False
+                logger.info("  Step 4c: Reset _DTYPE_HOOKS_INSTALLED flag")
+        except Exception:
+            pass
+        
+        # Step 5: Remove accelerate hooks
+        if cached.model is not None:
+            try:
+                from accelerate.hooks import remove_hook_from_module
+                for name, module in cached.model.named_modules():
+                    if hasattr(module, '_hf_hook'):
+                        remove_hook_from_module(module)
+            except (ImportError, Exception):
+                pass
+        
+        # Step 5a: Remove external monkey-patches on model submodules.
+        #
+        # Other custom nodes (e.g. seedvr2_videoupscaler) may monkey-patch
+        # methods on our model's submodules with closures that capture the
+        # model or its children.  These closures keep the entire model tree
+        # alive even after we delete our reference.
+        #
+        # Walk every submodule; for each instance attribute that is a
+        # function/method with a __closure__, break the closure cells.
+        # This is safe because we are about to delete the model anyway.
+        logger.info("  Step 5a: Removing external monkey-patches on submodules...")
+        if cached.model is not None:
+            import types as _types
+            import ctypes
+            ext_closures_broken = 0
+            try:
+                for mod_name, submod in cached.model.named_modules():
+                    # Check instance __dict__ for monkey-patched methods
+                    for attr_name in list(vars(submod).keys()):
+                        attr = vars(submod).get(attr_name)
+                        if attr is None:
+                            continue
+                        closure = None
+                        if isinstance(attr, _types.FunctionType):
+                            closure = attr.__closure__
+                        elif isinstance(attr, _types.MethodType):
+                            closure = getattr(attr.__func__, '__closure__', None)
+                        if closure:
+                            for cell in closure:
+                                try:
+                                    ctypes.pythonapi.PyCell_Set(
+                                        ctypes.py_object(cell),
+                                        ctypes.py_object(None))
+                                    ext_closures_broken += 1
+                                except Exception:
+                                    pass
+                            # Remove the monkey-patched attr entirely
+                            try:
+                                delattr(submod, attr_name)
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.debug(f"    Error during external unpatch: {e}")
+            logger.info(f"    5a: Broke {ext_closures_broken} closure cells "
+                        f"from external monkey-patches")
+        
+        # Step 5b: Cleanly reverse all monkey-patches on the model.
+        #
+        # CRITICAL: We must RESTORE original methods, not just break closure
+        # cells. Breaking cells leaves broken wrappers that corrupt the next
+        # model load (the new load wraps the broken wrapper, creating a
+        # corruption cascade that kills super() and pipeline.__call__).
+        logger.info("  Step 5b: Restoring original methods (unpatching)...")
+        if cached.model is not None:
+            model_id = id(cached.model)
+            logger.info(f"    Model object id: {model_id:#x}")
+            
+            # --- 5b.1+2+3: Unpatch generate_image and pipeline.__call__ ---
+            # Uses saved originals (_comfy_original_generate_image, _comfy_original_call)
+            try:
+                try:
+                    from .hunyuan_shared import unpatch_hunyuan_generate_image
+                except ImportError:
+                    from hunyuan_shared import unpatch_hunyuan_generate_image
+                unpatch_hunyuan_generate_image(cached.model)
+                logger.info("    5b.1-3: Unpatched generate_image + pipeline.__call__")
+            except ImportError:
+                logger.warning("    5b.1-3: unpatch_hunyuan_generate_image not available")
+            except Exception as e:
+                logger.warning(f"    5b.1-3: Error during unpatch: {e}")
+            
+            # --- 5b.4: Break VAE decode closure (backup) ---
+            # Step 3 already called unpatch_pipeline_pre_vae_cleanup to restore
+            # original decode, but the decode_with_cleanup function object may
+            # survive in gc. Force-break any remaining VAE closure cells.
+            pipeline = getattr(cached.model, 'pipeline', None)
+            vae = None
+            if pipeline is not None:
+                vae = getattr(pipeline, 'vae', None)
+            if vae is None:
+                vae = getattr(cached.model, 'vae', None)
+            if vae is not None:
+                # If decode_with_cleanup is still around as _original_decode
+                # or in some other attribute, break its closure
+                for vae_attr in ('decode', '_original_decode',
+                                 '_decode', '_original_forward'):
+                    fn = getattr(vae, vae_attr, None)
+                    if fn is not None and hasattr(fn, '__closure__') and fn.__closure__:
+                        import ctypes
+                        for cell in fn.__closure__:
+                            try:
+                                ctypes.pythonapi.PyCell_Set(
+                                    ctypes.py_object(cell),
+                                    ctypes.py_object(None))
+                            except Exception:
+                                pass
+                        logger.info(f"    5b.4: Cleared closure cells on "
+                                    f"vae.{vae_attr}")
+                # Also remove our patch markers
+                if hasattr(vae, '_prevae_cleanup_patched'):
+                    vae._prevae_cleanup_patched = False
+                if hasattr(vae, '_original_decode'):
+                    try:
+                        del vae._original_decode
+                    except Exception:
+                        pass
+            else:
+                logger.info("    5b.4: No VAE found")
+            
+            # --- 5b.5: NUCLEAR — walk ALL gc cells referencing this model ---
+            # After all targeted cleanup, find ANY remaining closure cell
+            # that still holds a reference to the model (directly or via
+            # its submodules) and break it.
+            import gc
+            import ctypes
+            _cell_sentinel = None
+            cell_type = type((lambda: _cell_sentinel).__closure__[0])
+            gc.collect()
+            
+            # Pre-build set of all module ids for O(1) lookup
+            # Also include pipeline and its submodules
+            model_module_ids = set()
+            try:
+                for _, submod in cached.model.named_modules():
+                    model_module_ids.add(id(submod))
+            except Exception:
+                pass
+            model_module_ids.add(id(cached.model))
+            if pipeline is not None:
+                model_module_ids.add(id(pipeline))
+                # Pipeline may have its own submodules
+                try:
+                    for _, submod in pipeline.named_modules():
+                        model_module_ids.add(id(submod))
+                except Exception:
+                    pass
+            
+            nuked = 0
+            for obj in gc.get_objects():
+                if type(obj) is not cell_type:
+                    continue
+                try:
+                    val = obj.cell_contents
+                except ValueError:
+                    continue
+                # Check if this cell holds our model, pipeline, or any
+                # of their submodules.
+                # CRITICAL: skip class objects (types) — Python stores __class__
+                # in a closure cell for super(); breaking it kills super() globally.
+                if isinstance(val, torch.nn.Module) and not isinstance(val, type) and id(val) in model_module_ids:
+                    ctypes.pythonapi.PyCell_Set(
+                        ctypes.py_object(obj), ctypes.py_object(None))
+                    nuked += 1
+                # Also check for callable capturing model (e.g. bound methods,
+                # partial objects holding the model)
+                elif callable(val) and hasattr(val, '__self__'):
+                    if id(getattr(val, '__self__', None)) in model_module_ids:
+                        ctypes.pythonapi.PyCell_Set(
+                            ctypes.py_object(obj), ctypes.py_object(None))
+                        nuked += 1
+            del model_module_ids
+            logger.info(f"    5b.5: Nuclear cell scan broke {nuked} closure cells")
+        
+        # Step 6: Clear attached metadata and free tensor storage in-place
+        logger.info("  Step 6: Clearing metadata and freeing tensor storage...")
+        
+        # Clean up local variables from earlier steps that hold submodule refs
+        # (pipeline, vae were set in Step 5b.4 and prevent gc of model)
+        try:
+            del pipeline
+        except (NameError, UnboundLocalError):
+            pass
+        try:
+            del vae
+        except (NameError, UnboundLocalError):
+            pass
+        
+        if cached.model is not None:
+            for attr in ('_hunyuan_info', '_hunyuan_path', '_block_swap_manager'):
+                if hasattr(cached.model, attr):
+                    try:
+                        setattr(cached.model, attr, None)
+                    except Exception:
+                        pass
+            
+            if cached.blocks_to_swap > 0:
+                # Block swap was active: free all tensor storage IN-PLACE.
+                # This releases GPU memory and pinned CPU buffers immediately
+                # without creating new CRT heap allocations (no model.to('cpu')).
+                #
+                # Even if the model object survives due to stale references
+                # (refcount > 1), the actual tensor data (~150GB) is freed.
+                logger.info("    Block swap active: freeing tensor storage in-place...")
+                freed_gpu_bytes = 0
+                freed_cpu_bytes = 0
+                empty_cpu = torch.empty(0, device='cpu')
+                
+                try:
+                    # Free ALL model parameters (blocks + non-block components)
+                    for name, param in cached.model.named_parameters():
+                        nbytes = param.data.numel() * param.data.element_size()
+                        if param.data.device.type == 'cuda':
+                            freed_gpu_bytes += nbytes
+                        else:
+                            freed_cpu_bytes += nbytes
+                        param.data = empty_cpu
+                    
+                    # Free ALL model buffers (registered buffers, embeddings, etc.)
+                    for name, buf in cached.model.named_buffers():
+                        nbytes = buf.data.numel() * buf.data.element_size()
+                        if buf.data.device.type == 'cuda':
+                            freed_gpu_bytes += nbytes
+                        else:
+                            freed_cpu_bytes += nbytes
+                        buf.data = empty_cpu
+                    
+                    # Also gut the VAE (may be parked on CPU with large tensors)
+                    for vae_path in ('vae', 'pipeline.vae'):
+                        vae_obj = cached.model
+                        try:
+                            for part in vae_path.split('.'):
+                                vae_obj = getattr(vae_obj, part)
+                            for name, param in vae_obj.named_parameters():
+                                nbytes = param.data.numel() * param.data.element_size()
+                                if param.data.device.type == 'cuda':
+                                    freed_gpu_bytes += nbytes
+                                else:
+                                    freed_cpu_bytes += nbytes
+                                param.data = empty_cpu
+                            for name, buf in vae_obj.named_buffers():
+                                nbytes = buf.data.numel() * buf.data.element_size()
+                                if buf.data.device.type == 'cuda':
+                                    freed_gpu_bytes += nbytes
+                                else:
+                                    freed_cpu_bytes += nbytes
+                                buf.data = empty_cpu
+                        except (AttributeError, StopIteration):
+                            pass
+                    
+                    del empty_cpu
+                    
+                    logger.info(f"    Freed {freed_gpu_bytes/1024**3:.1f}GB GPU + "
+                               f"{freed_cpu_bytes/1024**3:.1f}GB CPU tensor storage")
+                    
+                except Exception as e:
+                    logger.warning(f"    Tensor cleanup error: {e}")
+                
+                # Flush CUDA caching allocator to return freed GPU memory to CUDA
+                torch.cuda.empty_cache()
+                
+                vram_after = torch.cuda.memory_allocated() / 1024**3
+                vram_free = (torch.cuda.get_device_properties(0).total_memory 
+                            - torch.cuda.memory_reserved()) / 1024**3
+                logger.info(f"    After tensor cleanup: {vram_after:.1f}GB VRAM allocated, "
+                           f"~{vram_free:.1f}GB free")
+            else:
+                # No block swap: standard move to CPU before delete
+                try:
+                    if hasattr(cached.model, 'to') and not hasattr(cached.model, 'hf_device_map'):
+                        cached.model.to('cpu')
+                        logger.info("    Moved model to CPU")
+                except Exception as e:
+                    logger.warning(f"    Failed to move to CPU: {e}")
+        
+        # Step 7: Delete model and cache entry
+        logger.info("  Step 7: Deleting model reference...")
+        model_ref_count = sys.getrefcount(cached.model) if cached.model is not None else 0
+        logger.info(f"    Model refcount before del: {model_ref_count}")
         del cached.model
         del self._cache[key]
         
-        # Force cleanup
+        # Step 8: Aggressive garbage collection
+        logger.info("  Step 8: Garbage collection...")
         import gc
+        gc.collect()
+        gc.collect()
         gc.collect()
         torch.cuda.empty_cache()
         
-        logger.info(f"Fully unloaded: {key}")
+        # Step 8b: Post-delete nuclear gc scan
+        # After del cached.model and gc.collect, check if any nn.Module
+        # objects with significant parameter count survived
+        _cell_sentinel2 = None
+        cell_type = type((lambda: _cell_sentinel2).__closure__[0])
+        surviving_cells = 0
+        for obj in gc.get_objects():
+            if type(obj) is not cell_type:
+                continue
+            try:
+                val = obj.cell_contents
+            except ValueError:
+                continue
+            # Skip class objects (types) — they hold __class__ for super()
+            if isinstance(val, torch.nn.Module) and not isinstance(val, type):
+                try:
+                    param_count = sum(1 for _ in val.parameters())
+                    if param_count > 0:
+                        import ctypes
+                        ctypes.pythonapi.PyCell_Set(
+                            ctypes.py_object(obj),
+                            ctypes.py_object(None))
+                        surviving_cells += 1
+                except Exception:
+                    pass
+        if surviving_cells > 0:
+            logger.info(f"    Step 8b: Broke {surviving_cells} surviving "
+                        f"closure cells (post-delete)")
+            gc.collect()
+            gc.collect()
+        
+        # Step 9: Clear PyTorch internal allocator caches
+        logger.info("  Step 9: Clearing allocator caches...")
+        torch.cuda.empty_cache()
+        # Clear CUDA host (pinned memory) allocator cache
+        try:
+            torch._C._host_emptyCache()
+            logger.info("    Cleared CUDA host allocator cache")
+        except Exception:
+            pass
+        # Clear accelerator caches
+        try:
+            torch._C._accelerator_emptyCache()
+            logger.info("    Cleared accelerator cache")
+        except Exception:
+            pass
+        
+        # Step 10: Force Windows to return freed memory to OS
+        logger.info("  Step 10: Windows memory release...")
+        try:
+            from .hunyuan_shared import force_windows_memory_release
+        except ImportError:
+            from hunyuan_shared import force_windows_memory_release
+        force_windows_memory_release()
+        
+        # Report RAM freed
+        if ram_before is not None:
+            try:
+                ram_after = psutil.Process().memory_info().rss / 1024**3
+                ram_freed = ram_before - ram_after
+                logger.info(f"Fully unloaded: {key} "
+                           f"(RAM freed: {ram_freed:.1f}GB, current: {ram_after:.1f}GB)")
+            except Exception:
+                logger.info(f"Fully unloaded: {key}")
+        else:
+            logger.info(f"Fully unloaded: {key}")
     
     def _clear_cache_internal(self):
         """Clear entire cache (internal, must hold lock)."""
