@@ -736,40 +736,12 @@ class ModelCacheV2:
         logger.info("  Step 8: Garbage collection...")
         import gc
         gc.collect()
-        gc.collect()
-        gc.collect()
+        gc.collect()  # second pass catches garbage created by __del__ finalizers
         torch.cuda.empty_cache()
         
-        # Step 8b: Post-delete nuclear gc scan
-        # After del cached.model and gc.collect, check if any nn.Module
-        # objects with significant parameter count survived
-        _cell_sentinel2 = None
-        cell_type = type((lambda: _cell_sentinel2).__closure__[0])
-        surviving_cells = 0
-        for obj in gc.get_objects():
-            if type(obj) is not cell_type:
-                continue
-            try:
-                val = obj.cell_contents
-            except ValueError:
-                continue
-            # Skip class objects (types) — they hold __class__ for super()
-            if isinstance(val, torch.nn.Module) and not isinstance(val, type):
-                try:
-                    param_count = sum(1 for _ in val.parameters())
-                    if param_count > 0:
-                        import ctypes
-                        ctypes.pythonapi.PyCell_Set(
-                            ctypes.py_object(obj),
-                            ctypes.py_object(None))
-                        surviving_cells += 1
-                except Exception:
-                    pass
-        if surviving_cells > 0:
-            logger.info(f"    Step 8b: Broke {surviving_cells} surviving "
-                        f"closure cells (post-delete)")
-            gc.collect()
-            gc.collect()
+        # Step 8b removed — the scoped nuclear scan in Step 5b.5 already
+        # broke all closure cells referencing Hunyuan modules.  Any nn.Module
+        # surviving here belongs to downstream models (Marigold, segmentation, etc.)
         
         # Step 9: Clear PyTorch internal allocator caches
         logger.info("  Step 9: Clearing allocator caches...")

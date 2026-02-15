@@ -1752,12 +1752,16 @@ class HunyuanImage3ForceUnload:
                     "tooltip": "Clear ComfyUI's internal model cache (affects all models!)"
                 }),
                 "nuke_orphaned_tensors": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "DANGEROUS: Hunt and destroy ALL CUDA tensors in memory. Use after OOM when VRAM is stuck."
+                    "default": False,
+                    "tooltip": "Hunt and destroy orphaned Hunyuan CUDA tensors. "
+                               "Safe for downstream models (scoped to Hunyuan only). "
+                               "Use after OOM when VRAM is stuck."
                 }),
                 "nuke_ram_tensors": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "DANGEROUS: Also hunt and destroy orphaned CPU tensors in RAM. Use when system RAM is full of leaked model weights."
+                    "default": False,
+                    "tooltip": "Hunt and destroy orphaned Hunyuan CPU tensors in RAM. "
+                               "Safe for downstream models (scoped to Hunyuan only). "
+                               "Use when system RAM is full of leaked model weights."
                 }),
             },
             "optional": {
@@ -1936,28 +1940,38 @@ class HunyuanImage3ForceUnload:
                 report_lines.append(f"Scanning {len(all_objects)} Python objects...")
                 
                 # First pass: Find and clear nn.Module instances
-                # Build a set of models we want to KEEP (if not clearing them)
-                _skip_models = set()
+                # Build a set of Hunyuan model IDs — ONLY these get gutted.
+                # Everything else (Marigold, segmentation, ComfyUI internals)
+                # must be left untouched.
+                _hunyuan_ids = set()
                 if HunyuanModelCache._cached_model is not None:
-                    _skip_models.add(id(HunyuanModelCache._cached_model))
+                    try:
+                        for _, sub in HunyuanModelCache._cached_model.named_modules():
+                            _hunyuan_ids.add(id(sub))
+                    except Exception:
+                        pass
+                    _hunyuan_ids.add(id(HunyuanModelCache._cached_model))
                 try:
                     try:
                         from .hunyuan_instruct_nodes import _instruct_cache
                     except ImportError:
                         from hunyuan_instruct_nodes import _instruct_cache
                     if _instruct_cache.model is not None:
-                        _skip_models.add(id(_instruct_cache.model))
+                        try:
+                            for _, sub in _instruct_cache.model.named_modules():
+                                _hunyuan_ids.add(id(sub))
+                        except Exception:
+                            pass
+                        _hunyuan_ids.add(id(_instruct_cache.model))
                 except ImportError:
                     pass
                 
                 for obj in all_objects:
                     try:
                         if isinstance(obj, torch.nn.Module):
-                            # Skip cached models we handle separately
-                            if id(obj) in _skip_models:
-                                continue
+                            if id(obj) not in _hunyuan_ids:
+                                continue  # NOT a Hunyuan module — leave it alone
                             modules_found += 1
-                            # Clear all parameters
                             for param in obj.parameters():
                                 if param.device.type == 'cuda' and nuke_orphaned_tensors:
                                     ram_freed_estimate += param.numel() * param.element_size()
@@ -1967,7 +1981,6 @@ class HunyuanImage3ForceUnload:
                                     ram_freed_estimate += param.numel() * param.element_size()
                                     param.data = torch.empty(0)
                                     tensors_cleared += 1
-                            # Clear all buffers
                             for buf in obj.buffers():
                                 if buf.device.type == 'cuda' and nuke_orphaned_tensors:
                                     ram_freed_estimate += buf.numel() * buf.element_size()
@@ -1980,24 +1993,23 @@ class HunyuanImage3ForceUnload:
                     except Exception:
                         pass
                 
-                # Second pass: Find raw tensors
-                for obj in all_objects:
-                    try:
-                        if isinstance(obj, torch.Tensor):
-                            if obj.device.type == 'cuda':
-                                cuda_tensors_found += 1
-                                if nuke_orphaned_tensors:
-                                    ram_freed_estimate += obj.numel() * obj.element_size()
-                                    obj.data = torch.empty(0, device='cpu')
-                                    tensors_cleared += 1
-                            elif obj.device.type == 'cpu':
-                                cpu_tensors_found += 1
-                                if nuke_ram_tensors:
-                                    ram_freed_estimate += obj.numel() * obj.element_size()
-                                    obj.data = torch.empty(0)
-                                    tensors_cleared += 1
-                    except Exception:
-                        pass
+                # Second pass: Find raw tensors (only if explicitly enabled)
+                # NOTE: Raw tensor scan cannot be scoped to Hunyuan-only,
+                # so only run it when the user knowingly enables it.
+                if nuke_orphaned_tensors or nuke_ram_tensors:
+                    for obj in all_objects:
+                        try:
+                            if isinstance(obj, torch.Tensor) and not isinstance(obj, torch.nn.Parameter):
+                                if obj.device.type == 'cuda':
+                                    cuda_tensors_found += 1
+                                elif obj.device.type == 'cpu':
+                                    cpu_tensors_found += 1
+                                # Don't gut raw tensors — we can't tell who owns them
+                                # and gutting them destroys downstream models
+                        except Exception:
+                            pass
+                
+                del _hunyuan_ids
                 
                 report_lines.append(f"Found {modules_found} nn.Module instances")
                 report_lines.append(f"Found {cuda_tensors_found} CUDA tensors, {cpu_tensors_found} CPU tensors")
@@ -2688,6 +2700,15 @@ def force_windows_memory_release():
     
     kernel32 = ctypes.windll.kernel32
     
+    # Flush PyTorch's pinned memory cache FIRST — these pages are allocated
+    # via cudaHostAlloc, not the CRT heap, so _heapmin/HeapCompact can't touch them.
+    if torch.cuda.is_available():
+        try:
+            torch._C._cuda_CachingHostAllocator_emptyCache()
+            logger.info("  Flushed PyTorch CachingHostAllocator (pinned memory)")
+        except (AttributeError, RuntimeError):
+            pass
+        
     # 1. Ask CRT heap to return free blocks to the OS
     try:
         ctypes.cdll.msvcrt._heapmin()

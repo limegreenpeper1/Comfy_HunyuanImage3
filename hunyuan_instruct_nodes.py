@@ -738,6 +738,108 @@ def _aggressive_vram_cleanup(model: Any, context: str = "generation") -> None:
                            f"{free_bytes/1024**3:.1f}GB free / "
                            f"{total_bytes/1024**3:.1f}GB total")
 
+def _flush_pinned_memory_cache() -> bool:
+    """Flush PyTorch's CachingHostAllocator to return pinned pages to OS.
+    
+    After pinned tensors are freed (refcount → 0), their backing memory
+    goes to PyTorch's internal host allocator free list rather than back
+    to the OS. This can hold ~93-130GB of 'freed' pinned pages.
+    
+    This function tries multiple API paths to flush that free list,
+    calling cudaFreeHost() on each block → VirtualFree() on Windows.
+    
+    Returns True if cache was flushed, False if no API available.
+    """
+    if not torch.cuda.is_available():
+        return False
+    
+    # Try every known API path for flushing the host allocator cache
+    api_attempts = [
+        ("torch._C._cuda_CachingHostAllocator_emptyCache",
+         lambda: torch._C._cuda_CachingHostAllocator_emptyCache()),
+        ("torch._C._host_emptyCache",
+         lambda: torch._C._host_emptyCache()),
+        ("torch.cuda.memory._host_emptyCache",
+         lambda: torch.cuda.memory._host_emptyCache()),
+    ]
+    
+    for name, api_call in api_attempts:
+        try:
+            api_call()
+            logger.info(f"  Flushed PyTorch pinned memory (host) cache via {name}")
+            return True
+        except AttributeError:
+            logger.debug(f"  {name}: not found (AttributeError)")
+        except (RuntimeError, TypeError) as e:
+            logger.warning(f"  {name}: call failed: {e}")
+    
+    # Diagnostic: list all potentially relevant torch._C symbols
+    host_syms = [s for s in dir(torch._C) if any(
+        k in s.lower() for k in ('host', 'pin', 'cachinghost'))]
+    if host_syms:
+        logger.info(f"  Available host-related torch._C symbols: {host_syms}")
+    else:
+        logger.info("  No host/pin/cachinghost symbols found in torch._C")
+    
+    # Fallback: try to call via ctypes into the PyTorch shared library
+    # The C++ function c10::cuda::CachingHostAllocator_emptyCache() is
+    # exported from torch_cuda.dll / libtorch_cuda.so
+    flushed_via_ctypes = _flush_pinned_via_ctypes()
+    if flushed_via_ctypes:
+        return True
+    
+    logger.warning("  CachingHostAllocator.emptyCache() not available — "
+                   "pinned memory may not be returned to OS")
+    return False
+
+
+def _flush_pinned_via_ctypes() -> bool:
+    """Try to call CachingHostAllocator_emptyCache via ctypes symbol lookup.
+    
+    PyTorch may not expose this function to Python, but the C++ symbol
+    is exported from the shared library. We look for it using ctypes.
+    """
+    import ctypes
+    import sys
+    import os
+    
+    if sys.platform != 'win32':
+        return False  # TODO: Linux .so lookup
+    
+    # Find PyTorch's CUDA shared library
+    torch_lib_dir = os.path.dirname(torch.__file__)
+    lib_dir = os.path.join(torch_lib_dir, 'lib')
+    
+    # Candidate DLLs that might export the function
+    dll_candidates = ['torch_cuda.dll', 'c10_cuda.dll', 'torch_cuda_cu.dll']
+    
+    for dll_name in dll_candidates:
+        dll_path = os.path.join(lib_dir, dll_name)
+        if not os.path.exists(dll_path):
+            continue
+        try:
+            lib = ctypes.CDLL(dll_path)
+            # Try to find the exported symbol
+            # C++ name mangling varies, but the C-linkage wrapper (if any) is clean
+            for sym_name in [
+                'CachingHostAllocator_emptyCache',
+                '_ZN3c104cuda31CachingHostAllocator_emptyCacheEv',  # GCC/Clang mangling
+                '?CachingHostAllocator_emptyCache@cuda@c10@@YAXXZ',  # MSVC mangling
+            ]:
+                try:
+                    func = getattr(lib, sym_name)
+                    func.restype = None
+                    func.argtypes = []
+                    func()
+                    logger.info(f"  Flushed pinned cache via ctypes: {dll_name}::{sym_name}")
+                    return True
+                except (AttributeError, OSError):
+                    continue
+        except OSError:
+            continue
+    
+    logger.debug("  ctypes: could not find CachingHostAllocator_emptyCache in PyTorch DLLs")
+    return False
 
 def get_instruct_model_dirs() -> List[str]:
     """Find Instruct model directories in registered model paths.
@@ -1269,6 +1371,17 @@ class InstructModelCache:
                     logger.info(f"  After nuclear: reserved={reserved_final:.1f}GB, "
                                f"CUDA free={free_final/1024**3:.1f}GB")
 
+            # Step 8a: Flush pinned memory (host) cache
+            # After gutting tensor storage (Step 6) and gc (Step 8), freed
+            # pinned buffers (~93GB from BlockSwapManager) sit in PyTorch's
+            # CachingHostAllocator free list. Without flushing, these pages
+            # are never returned to the OS via cudaFreeHost/VirtualFree.
+            rss_before_pin = psutil.Process().memory_info().rss / 1024**3
+            _flush_pinned_memory_cache()
+            rss_after_pin = psutil.Process().memory_info().rss / 1024**3
+            logger.info(f"  Pinned cache flush: RSS {rss_before_pin:.1f}GB → "
+                       f"{rss_after_pin:.1f}GB "
+                       f"(freed {rss_before_pin - rss_after_pin:.1f}GB)")
 
 # Global cache instance
 _instruct_cache = InstructModelCache()
