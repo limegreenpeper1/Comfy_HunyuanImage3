@@ -90,6 +90,7 @@ def _move_non_block_components_to_gpu(
         if comp is not None and hasattr(comp, "to"):
             size = sum(p.numel() * p.element_size() for p in comp.parameters()) if hasattr(comp, "parameters") else 0
             comp.to(target_device)
+            _fix_int8_module_devices(comp, target_device, label=name, verbose=verbose)
             total_bytes += size
             if verbose >= 2:
                 logger.info(f"  Moved {name} to {target_device} ({size / 1024**3:.2f}GB)")
@@ -102,6 +103,7 @@ def _move_non_block_components_to_gpu(
             if comp is not None and hasattr(comp, "to"):
                 size = sum(p.numel() * p.element_size() for p in comp.parameters()) if hasattr(comp, "parameters") else 0
                 comp.to(target_device)
+                _fix_int8_module_devices(comp, target_device, label=f"model.{name}", verbose=verbose)
                 total_bytes += size
                 if verbose >= 2:
                     logger.info(f"  Moved model.{name} to {target_device} ({size / 1024**3:.2f}GB)")
@@ -111,6 +113,7 @@ def _move_non_block_components_to_gpu(
     if lm_head is not None and hasattr(lm_head, "to"):
         size = sum(p.numel() * p.element_size() for p in lm_head.parameters()) if hasattr(lm_head, "parameters") else 0
         lm_head.to(target_device)
+        _fix_int8_module_devices(lm_head, target_device, label="lm_head", verbose=verbose)
         total_bytes += size
         if verbose >= 2:
             logger.info(f"  Moved lm_head to {target_device} ({size / 1024**3:.2f}GB)")
@@ -119,6 +122,50 @@ def _move_non_block_components_to_gpu(
     if verbose >= 1:
         logger.info(f"  Moved non-block components to {target_device}: {total_gb:.2f}GB total")
     return total_gb
+
+
+def _fix_int8_module_devices(module: Any, device: torch.device, label: str = "", verbose: int = 1) -> int:
+    """
+    Fix INT8 weight.CB/SCB after calling module.to(device).
+    
+    bitsandbytes Linear8bitLt.to() and Module._apply() both fail to move
+    weight.CB and weight.SCB to the target device. This function walks all
+    child modules and fixes any Linear8bitLt layers.
+    
+    Returns: number of tensors fixed
+    """
+    fixed = 0
+    try:
+        from bitsandbytes.nn import Linear8bitLt
+    except ImportError:
+        return 0
+    
+    for name, child in module.named_modules():
+        if isinstance(child, Linear8bitLt):
+            full_name = f"{label}.{name}" if name else label
+            weight = child.weight
+            # Fix weight.CB
+            if hasattr(weight, 'CB') and weight.CB is not None and weight.CB.device != device:
+                if verbose >= 2:
+                    logger.info(f"  [INT8 fix] {full_name}: weight.CB {weight.CB.device} -> {device}")
+                weight.CB = weight.CB.to(device)
+                fixed += 1
+            # Fix weight.SCB
+            if hasattr(weight, 'SCB') and weight.SCB is not None and weight.SCB.device != device:
+                if verbose >= 2:
+                    logger.info(f"  [INT8 fix] {full_name}: weight.SCB {weight.SCB.device} -> {device}")
+                weight.SCB = weight.SCB.to(device)
+                fixed += 1
+            # Fix state.CB/SCB (may exist after first forward)
+            if hasattr(child, 'state'):
+                state = child.state
+                if state.CB is not None and state.CB.device != device:
+                    state.CB = state.CB.to(device)
+                    fixed += 1
+                if state.SCB is not None and state.SCB.device != device:
+                    state.SCB = state.SCB.to(device)
+                    fixed += 1
+    return fixed
 
 
 class CleanModelLoader:
@@ -205,7 +252,10 @@ class CleanModelLoader:
         elif quant_type == "nf4":
             result = cls._load_nf4(model_path, device, dtype)
         elif quant_type == "int8":
-            result = cls._load_int8(model_path, device, dtype)
+            if blocks_to_swap > 0:
+                result = cls._load_int8_block_swap(model_path, device, dtype)
+            else:
+                result = cls._load_int8(model_path, device, dtype)
         elif quant_type == "gguf":
             result = cls._load_gguf(model_path, device, dtype)
         else:
@@ -530,12 +580,23 @@ class CleanModelLoader:
         if hasattr(model, "hf_device_map"):
             delattr(model, "hf_device_map")
 
-        # Remove any accelerate dispatch hooks installed by device_map="cpu"
+        # Remove any accelerate dispatch hooks installed by device_map="cpu".
+        # remove_hook_from_module() restores _old_forward as an instance-level
+        # `forward` attribute, which shadows the class method.  We delete that
+        # instance attribute so only the class method remains — this prevents
+        # the cache-clear monkey-patch remover from finding it later and
+        # accidentally nuking its __class__ closure cell (breaking super()).
         try:
             from accelerate.hooks import remove_hook_from_module
             for _name, module in model.named_modules():
                 if hasattr(module, "_hf_hook"):
                     remove_hook_from_module(module)
+                # Clean up stale instance-level forward left by hook removal
+                if "forward" in vars(module):
+                    try:
+                        delattr(module, "forward")
+                    except Exception:
+                        pass
         except (ImportError, Exception):
             pass
 
@@ -616,6 +677,123 @@ class CleanModelLoader:
         )
     
     @classmethod
+    def _load_int8_block_swap(
+        cls,
+        model_path: str,
+        device: str,
+        dtype: torch.dtype,
+    ) -> LoadResult:
+        """
+        Load pre-quantized INT8 model to CPU, then move non-block components to GPU.
+
+        This mirrors the Instruct node's proven INT8 block-swap path:
+        1. Load entire model to CPU (no quantization_config — weights are pre-quantized)
+        2. Move non-block components (VAE, embeddings, projections) to GPU
+        3. Leave 32 transformer blocks on CPU for BlockSwapManager
+        4. Fix INT8 CB/SCB device mismatches after .to() calls
+
+        Pre-quantized INT8 models store weights as int8 with SCB scales on disk.
+        Int8Params.to(device) fully supports GPU↔CPU movement, making block swap
+        viable. This is the same approach used by the Instruct loader.
+
+        Returns a LoadResult with is_moveable=True (blocks can be swapped).
+        """
+        logger.info(f"Loading INT8 model from {model_path} (block-swap mode)")
+        logger.info("INT8 model → CPU first, then non-block parts to GPU")
+        logger.info("Transformer blocks will be managed by BlockSwapManager")
+
+        # Clear CUDA cache before loading
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        # Log system RAM availability
+        try:
+            import psutil
+            ram = psutil.virtual_memory()
+            logger.info(
+                f"System RAM: {ram.available / 1024**3:.1f}GB available / "
+                f"{ram.total / 1024**3:.1f}GB total ({ram.percent:.1f}% used)"
+            )
+        except ImportError:
+            pass
+
+        # Load entirely to CPU — no quantization_config needed for pre-quantized models
+        logger.info("Loading pre-quantized INT8 model to CPU (low_cpu_mem_usage=True)...")
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map="cpu",
+                trust_remote_code=True,
+                torch_dtype=dtype,
+                attn_implementation="sdpa",
+                moe_impl="eager",
+                moe_drop_tokens=True,
+                low_cpu_mem_usage=True,
+                # No quantization_config — model is pre-quantized on disk
+            )
+        except TypeError:
+            logger.warning("Falling back to minimal load args")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map="cpu",
+                trust_remote_code=True,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+            )
+
+        # Move non-block components to GPU (includes INT8 CB/SCB fix)
+        target = torch.device(device)
+        moved_gb = _move_non_block_components_to_gpu(model, target)
+        logger.info(f"Moved {moved_gb:.2f}GB of non-block components to {device}")
+
+        # Remove stale hf_device_map (we manage placement ourselves now)
+        if hasattr(model, "hf_device_map"):
+            delattr(model, "hf_device_map")
+
+        # Remove any accelerate dispatch hooks installed by device_map="cpu".
+        # remove_hook_from_module() restores _old_forward as an instance-level
+        # `forward` attribute, which shadows the class method.  We delete that
+        # instance attribute so only the class method remains — this prevents
+        # the cache-clear monkey-patch remover from finding it later and
+        # accidentally nuking its __class__ closure cell (breaking super()).
+        try:
+            from accelerate.hooks import remove_hook_from_module
+            for _name, module in model.named_modules():
+                if hasattr(module, "_hf_hook"):
+                    remove_hook_from_module(module)
+                # Clean up stale instance-level forward left by hook removal
+                if "forward" in vars(module):
+                    try:
+                        delattr(module, "forward")
+                    except Exception:
+                        pass
+        except (ImportError, Exception):
+            pass
+
+        # Load tokenizer
+        if hasattr(model, 'load_tokenizer'):
+            model.load_tokenizer(model_path)
+            logger.info("Tokenizer loaded")
+
+        # Ensure VAE is in full precision on GPU
+        if hasattr(model, 'vae'):
+            model.vae = model.vae.to(device=target, dtype=dtype)
+            logger.info("VAE configured in full precision (bfloat16)")
+
+        logger.info("INT8 model ready for block-swap inference")
+
+        return LoadResult(
+            model=model,
+            quant_type="int8",
+            is_moveable=True,  # Blocks can be moved GPU↔CPU for block swap
+            device=device,
+            dtype=dtype,
+            load_time_seconds=0.0,
+            uses_device_map=False,
+        )
+
+    @classmethod
     def _load_int8(
         cls,
         model_path: str,
@@ -623,16 +801,16 @@ class CleanModelLoader:
         dtype: torch.dtype
     ) -> LoadResult:
         """
-        Load INT8 quantized model.
+        Load pre-quantized INT8 model directly to GPU (no block swap).
         
-        IMPORTANT: INT8 models CANNOT be moved after loading!
-        The quantization state is tied to the original device.
-        We must use device_map="auto" for INT8.
+        For GPUs with enough VRAM to hold the entire INT8 model (~80GB)
+        plus inference headroom (~15-25GB). This is the fastest path
+        but requires a large GPU (96GB+).
         
-        INT8 Hunyuan is ~45GB and needs a high-VRAM GPU.
+        Falls back to device_map="auto" if direct loading fails.
         """
         logger.info(f"Loading INT8 model from {model_path}")
-        logger.warning("INT8 models cannot be moved after loading - soft_unload and block_swap will NOT work")
+        logger.info("INT8 direct-to-GPU mode (no block swap)")
         
         # Clear CUDA cache before loading
         if torch.cuda.is_available():

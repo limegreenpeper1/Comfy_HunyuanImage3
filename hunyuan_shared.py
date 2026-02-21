@@ -251,7 +251,9 @@ def _efficient_moe_forward(self, hidden_states):
     Memory: O(N * hidden_size) instead of O(N * experts * capacity)
     Speed: Similar — same expert MLPs run on same data, just dispatched differently.
     """
-    torch.cuda.set_device(hidden_states.device.index)
+    # NOTE: removed torch.cuda.set_device(hidden_states.device.index) — it's
+    # unnecessary (CUDA kernels launch on the tensor's device, not the global
+    # default) and mutates thread-local state that could confuse other code.
     bsz, seq_len, hidden_size = hidden_states.shape
 
     # Shared MLP (if used)
@@ -1327,6 +1329,20 @@ class HunyuanModelCache:
                                 import ctypes as _ct
                                 for cell in closure:
                                     try:
+                                        _val = cell.cell_contents
+                                    except ValueError:
+                                        continue
+                                    # CRITICAL: never nuke __class__ cells.
+                                    # Python stores the enclosing class in a
+                                    # closure cell for zero-arg super(); the
+                                    # cell lives on the class-level function
+                                    # object and is shared by ALL instances.
+                                    # Nuking it permanently breaks super()
+                                    # for the entire class (including future
+                                    # instances loaded via sys.modules).
+                                    if isinstance(_val, type):
+                                        continue
+                                    try:
                                         _ct.pythonapi.PyCell_Set(
                                             _ct.py_object(cell),
                                             _ct.py_object(None))
@@ -2332,6 +2348,7 @@ def patch_hunyuan_generate_image(model):
 
         # Extract callback_on_step_end so we can pass it ONLY to the final image gen step
         callback_on_step_end = kwargs.pop("callback_on_step_end", None)
+        latents = kwargs.pop("latents", None)  # LATENT CONTROL: extract custom latents
 
         if stream:
             from transformers import TextStreamer
@@ -2380,6 +2397,8 @@ def patch_hunyuan_generate_image(model):
         gen_kwargs = kwargs.copy()
         if callback_on_step_end is not None:
             gen_kwargs["callback_on_step_end"] = callback_on_step_end
+        if latents is not None:  # LATENT CONTROL: pass through custom latents
+            gen_kwargs["latents"] = latents
             
         # PASS callback_on_step_end here
         outputs = self._generate(**model_inputs, **gen_kwargs, verbose=verbose)
@@ -2412,6 +2431,11 @@ def patch_hunyuan_generate_image(model):
                         # Only set it if not already provided explicitly
                         if kwargs.get('callback_on_step_end') is None:
                             kwargs['callback_on_step_end'] = cb
+                    # LATENT CONTROL: extract latents from model_kwargs → top-level pipeline kwarg
+                    if 'latents' in model_kwargs:
+                        lat = model_kwargs.pop('latents')
+                        if kwargs.get('latents') is None:
+                            kwargs['latents'] = lat
                 return original_call(self, *args, **kwargs)
             
             pipeline_class.__call__ = new_pipeline_call

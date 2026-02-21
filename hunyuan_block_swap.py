@@ -133,15 +133,27 @@ class BlockSwapManager:
         # Check if model uses INT8 quantization (bitsandbytes)
         self._has_int8_layers = self._detect_int8_layers()
         
+        # Check if model uses NF4 quantization (bitsandbytes Params4bit)
+        self._has_nf4_layers = self._detect_nf4_layers()
+        
         # Pre-allocated pinned CPU buffers to prevent CRT heap fragmentation.
         # Maps block_idx -> {param_name: pinned_cpu_tensor, ...}
         # Created by _create_cpu_buffer_store() during setup_initial_placement().
+        # NOTE: Not used for NF4 models (Params4bit has quant_state that the
+        # buffered path cannot handle — we use block.to() instead).
+        # NOTE: Not used for INT8 models because on Windows WDDM, pinned CPU
+        # memory (cudaHostAlloc) is mapped into GPU address space and counted
+        # against GPU memory by cuMemGetInfo.  67GB of pinned buffers can
+        # exhaust a 96GB GPU, leaving no room for inference activations.
         self._cpu_param_store: Dict[int, Dict[str, torch.Tensor]] = {}
         
         logger.info(f"BlockSwapManager initialized: {self.num_blocks} blocks found")
         logger.info(f"  Config: swap={config.blocks_to_swap}, prefetch={config.prefetch_blocks}")
+        if self._has_nf4_layers:
+            logger.info(f"  NF4 quantized layers detected - using block.to() path (quant_state safe)")
         if self._has_int8_layers:
-            logger.info(f"  INT8 quantized layers detected - will handle state.CB/SCB during swaps")
+            logger.info(f"  INT8 quantized layers detected - using block.to() path "
+                       f"(pinned buffers consume GPU address space on Windows WDDM)")
     
     def _detect_int8_layers(self) -> bool:
         """Check if any block contains bitsandbytes Linear8bitLt layers."""
@@ -153,6 +165,30 @@ class BlockSwapManager:
                         return True
         except ImportError:
             pass
+        return False
+    
+    def _detect_nf4_layers(self) -> bool:
+        """Check if any block contains bitsandbytes NF4/4-bit quantized parameters.
+        
+        NF4 parameters (Params4bit) store quantized data + quant_state (absmax,
+        code, offset). The buffered block swap path only moves param.data and
+        misses quant_state, leaving stale GPU pointers that cause
+        cudaErrorIllegalAddress. We must use block.to() for NF4 blocks instead.
+        """
+        try:
+            from bitsandbytes.nn import Params4bit
+            for block in self.blocks:
+                for param in block.parameters():
+                    if isinstance(param, Params4bit):
+                        return True
+        except ImportError:
+            pass
+        # Fallback: check for quant_state attribute
+        if not self.blocks:
+            return False
+        for param in self.blocks[0].parameters():
+            if hasattr(param, 'quant_state') and param.quant_state is not None:
+                return True
         return False
     
     def _fix_int8_state_devices(self, block: nn.Module, device: torch.device) -> None:
@@ -174,6 +210,13 @@ class BlockSwapManager:
         - After first forward: init_8bit_state() moves weight.CB -> state.CB, weight.CB = None
         - After matmul: weight.data is set to state.CB (they share the same tensor)
         
+        CRITICAL ALIASING INVARIANT:
+        After init_8bit_state(), weight.data and state.CB point to the SAME tensor.
+        We must maintain this alias during device transfers. If we create separate
+        tensors via state.CB.to(device), each block's memory is DOUBLED — both on
+        GPU (causing OOM) and in pinned CPU RAM (causing massive RSS bloat).
+        Fix: always set state.CB = weight.data after moving weight.data.
+        
         This method explicitly moves ALL int8 data to the target device.
         """
         if not self._has_int8_layers:
@@ -188,12 +231,31 @@ class BlockSwapManager:
         for name, module in block.named_modules():
             if isinstance(module, Linear8bitLt):
                 # Fix weight.CB/SCB (before first forward, these hold the compressed data)
+                #
+                # ALIASING FIX for weight.CB:
+                # Before init_8bit_state(), weight.CB holds the compressed int8
+                # buffer — the same content as weight.data.  block.to(device)
+                # already moved weight.data to `device` via _apply(fn), but
+                # weight.CB is an attribute NOT covered by _apply, so it stays
+                # on the source device.  Creating a SEPARATE GPU tensor via
+                # weight.CB.to(device) DOUBLES the memory per block.  Instead,
+                # alias weight.CB = weight.data when shapes match.
                 weight = module.weight
                 if hasattr(weight, 'CB') and weight.CB is not None and weight.CB.device != device:
-                    if self.config.debug or not hasattr(self, '_int8_fix_logged'):
-                        logger.info(f"  [INT8 fix] {name}: weight.CB {weight.CB.device} -> {device}")
-                    weight.CB = weight.CB.to(device)
-                    fixed_count += 1
+                    if (weight.data.device == device
+                            and weight.data.shape == weight.CB.shape
+                            and weight.data.dtype == weight.CB.dtype):
+                        # Alias — zero-copy, prevents doubling
+                        weight.CB = weight.data
+                        fixed_count += 1
+                        if self.config.debug or not hasattr(self, '_int8_fix_logged'):
+                            logger.info(f"  [INT8 fix] {name}: weight.CB aliased to weight.data on {device}")
+                    else:
+                        # Shape/dtype mismatch (e.g. before quantization) — must copy
+                        if self.config.debug or not hasattr(self, '_int8_fix_logged'):
+                            logger.info(f"  [INT8 fix] {name}: weight.CB {weight.CB.device} -> {device}")
+                        weight.CB = weight.CB.to(device)
+                        fixed_count += 1
                 if hasattr(weight, 'SCB') and weight.SCB is not None and weight.SCB.device != device:
                     if self.config.debug or not hasattr(self, '_int8_fix_logged'):
                         logger.info(f"  [INT8 fix] {name}: weight.SCB {weight.SCB.device} -> {device}")
@@ -201,18 +263,37 @@ class BlockSwapManager:
                     fixed_count += 1
                 
                 # Fix state.CB/SCB (after first forward, these hold the compressed data)
+                #
+                # ALIASING FIX: After init_8bit_state(), state.CB and weight.data
+                # are the SAME tensor. The main param loop (or block.to()) has
+                # already moved weight.data to `device`. Re-alias state.CB to
+                # weight.data instead of creating a SEPARATE tensor via
+                # state.CB.to(device) — that would double the memory per block.
                 if hasattr(module, 'state'):
                     state = module.state
                     if state.CB is not None and state.CB.device != device:
-                        if self.config.debug or not hasattr(self, '_int8_fix_logged'):
-                            logger.info(f"  [INT8 fix] {name}: state.CB {state.CB.device} -> {device}")
-                        state.CB = state.CB.to(device)
-                        fixed_count += 1
+                        if weight.data.device == device:
+                            # weight.data already on target — re-alias (zero-copy)
+                            state.CB = weight.data
+                            fixed_count += 1
+                            if self.config.debug or not hasattr(self, '_int8_fix_logged'):
+                                logger.info(f"  [INT8 fix] {name}: state.CB aliased to weight.data on {device}")
+                        else:
+                            # weight.data not yet on target (shouldn't happen in normal
+                            # flow, but handle gracefully)
+                            if self.config.debug or not hasattr(self, '_int8_fix_logged'):
+                                logger.info(f"  [INT8 fix] {name}: state.CB {state.CB.device} -> {device}")
+                            state.CB = state.CB.to(device)
+                            fixed_count += 1
                     if state.SCB is not None and state.SCB.device != device:
-                        if self.config.debug or not hasattr(self, '_int8_fix_logged'):
-                            logger.info(f"  [INT8 fix] {name}: state.SCB {state.SCB.device} -> {device}")
-                        state.SCB = state.SCB.to(device)
+                        # SCB (scales) is small — no significant doubling concern
+                        if hasattr(weight, 'SCB') and weight.SCB is not None and weight.SCB.device == device:
+                            state.SCB = weight.SCB
+                        else:
+                            state.SCB = state.SCB.to(device)
                         fixed_count += 1
+                        if self.config.debug or not hasattr(self, '_int8_fix_logged'):
+                            logger.info(f"  [INT8 fix] {name}: state.SCB -> {device}")
         
         if fixed_count > 0 and not hasattr(self, '_int8_fix_logged'):
             self._int8_fix_logged = True
@@ -351,6 +432,32 @@ class BlockSwapManager:
         if self.config.blocks_to_swap == 0:
             return
         
+        # NF4 models: skip pinned buffer creation entirely.
+        # Params4bit has quant_state (absmax, code, offset) that the buffered
+        # path doesn't handle. Without quant_state, the dequantize kernel
+        # accesses stale GPU pointers → cudaErrorIllegalAddress.
+        # Instead, we fall back to block.to() which properly handles
+        # Params4bit.to() → QuantState.to() for all internal tensors.
+        if self._has_nf4_layers:
+            logger.info("NF4 model: skipping pinned buffer store (block.to() handles quant_state)")
+            return
+        
+        # INT8 models: skip pinned buffer creation entirely.
+        # On Windows WDDM, pinned CPU memory (cudaHostAlloc) is mapped into
+        # the GPU's address space and cuMemGetInfo counts it as consumed GPU
+        # memory.  With 28 blocks × ~2.4GB = ~67GB of pinned buffers, this
+        # leaves only ~4GB free on a 96GB GPU → Fatal abort on first matmul.
+        # Additionally, INT8 has complex aliasing between weight.data,
+        # weight.CB, and state.CB that the buffered path cannot preserve
+        # without doubling memory.  By falling back to block.to() +
+        # _fix_int8_state_devices (with aliasing fix), both issues are
+        # resolved.  The tradeoff is potential CRT heap fragmentation on
+        # Windows, but INT8 users typically have ample system RAM.
+        if self._has_int8_layers:
+            logger.info("INT8 model: skipping pinned buffer store "
+                       "(pinned memory consumes GPU address space on Windows WDDM)")
+            return
+        
         swap_start = self.num_blocks - self.config.blocks_to_swap
         total_bytes = 0
         pinned_count = 0
@@ -487,6 +594,13 @@ class BlockSwapManager:
         
         Lazily creates pinned buffers for tensors that didn't exist at
         snapshot time (e.g. state.CB after init_8bit_state runs).
+        
+        ALIASING FIX: After init_8bit_state(), state.CB and weight.data are
+        the SAME tensor. The main param loop in _move_block_to_device() has
+        already moved weight.data into its pinned buffer. We must alias
+        state.CB to that same buffer instead of allocating a separate one.
+        Without this, every swapped block's memory is doubled in pinned RAM
+        AND when loaded back to GPU.
         """
         try:
             from bitsandbytes.nn import Linear8bitLt
@@ -499,7 +613,7 @@ class BlockSwapManager:
             
             weight = module.weight
             
-            # weight.CB / weight.SCB
+            # weight.CB / weight.SCB (exist before first forward, None after)
             for attr in ('CB', 'SCB'):
                 tensor = getattr(weight, attr, None)
                 if tensor is None or tensor.device.type == 'cpu':
@@ -515,22 +629,46 @@ class BlockSwapManager:
                     store[key] = buf
                     setattr(weight, attr, buf)
             
-            # state.CB / state.SCB
+            # state.CB / state.SCB (exist after first forward)
+            #
+            # ALIASING FIX for state.CB:
+            # After init_8bit_state(), state.CB IS weight.data (same tensor).
+            # The main param loop already copied weight.data into its pinned
+            # buffer and set weight.data = pinned_buffer. So weight.data is
+            # now on CPU in the pinned buffer. Re-alias state.CB to weight.data
+            # instead of allocating a SECOND pinned buffer with the same data.
             if hasattr(module, 'state'):
                 state = module.state
-                for attr in ('CB', 'SCB'):
-                    tensor = getattr(state, attr, None)
-                    if tensor is None or tensor.device.type == 'cpu':
-                        continue
-                    key = f"__int8__{name}__state_{attr}"
-                    if key in store:
-                        store[key].copy_(tensor, non_blocking=non_blocking)
-                        setattr(state, attr, store[key])
+                
+                # state.CB → alias to weight.data (already in pinned buffer)
+                if state.CB is not None and state.CB.device.type != 'cpu':
+                    if weight.data.device.type == 'cpu':
+                        # weight.data already moved to pinned buffer — re-alias
+                        state.CB = weight.data
                     else:
-                        buf, _ = self._alloc_pinned_buffer(tensor)
-                        buf.copy_(tensor, non_blocking=non_blocking)
+                        # Fallback: weight.data somehow not on CPU yet.
+                        # This shouldn't happen in normal flow, but handle it.
+                        key = f"__int8__{name}__state_CB"
+                        if key in store:
+                            store[key].copy_(state.CB, non_blocking=non_blocking)
+                            state.CB = store[key]
+                        else:
+                            buf, _ = self._alloc_pinned_buffer(state.CB)
+                            buf.copy_(state.CB, non_blocking=non_blocking)
+                            store[key] = buf
+                            state.CB = buf
+                
+                # state.SCB (scales — small tensor, no significant doubling)
+                if state.SCB is not None and state.SCB.device.type != 'cpu':
+                    key = f"__int8__{name}__state_SCB"
+                    if key in store:
+                        store[key].copy_(state.SCB, non_blocking=non_blocking)
+                        state.SCB = store[key]
+                    else:
+                        buf, _ = self._alloc_pinned_buffer(state.SCB)
+                        buf.copy_(state.SCB, non_blocking=non_blocking)
                         store[key] = buf
-                        setattr(state, attr, buf)
+                        state.SCB = buf
     
     # ------------------------------------------------------------------
     # Initial placement
@@ -900,7 +1038,15 @@ class BlockSwapManager:
             store = self._cpu_param_store.get(prefetch_idx)
             
             with torch.cuda.stream(self._prefetch_stream):
-                if store is not None:
+                if self._has_nf4_layers:
+                    # NF4: must use block.to() to properly move quant_state
+                    block.to(self.target_device, non_blocking=True)
+                elif self._has_int8_layers:
+                    # INT8: must use block.to() + aliasing fix.
+                    # Pinned buffer store is skipped for INT8 (WDDM issue).
+                    block.to(self.target_device, non_blocking=True)
+                    self._fix_int8_state_devices(block, self.target_device)
+                elif store is not None:
                     # Param-level transfers from pinned buffers (fast DMA)
                     for name, param in block.named_parameters():
                         if param.data.device != self.target_device:

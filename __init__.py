@@ -41,6 +41,8 @@ HIGHRES_MAPPINGS = {}
 HIGHRES_DISPLAY_MAPPINGS = {}
 MOE_TEST_MAPPINGS = {}
 MOE_TEST_DISPLAY_MAPPINGS = {}
+LATENT_MAPPINGS = {}
+LATENT_DISPLAY_MAPPINGS = {}
 
 try:
     from .hunyuan_unified_v2 import NODE_CLASS_MAPPINGS as UNIFIED_V2_MAPPINGS
@@ -66,6 +68,12 @@ try:
 except Exception as e:
     print(f"[Eric_Hunyuan3] Warning: Could not load hunyuan_moe_test_node: {e}")
 
+try:
+    from .hunyuan_latent_nodes import NODE_CLASS_MAPPINGS as LATENT_MAPPINGS
+    from .hunyuan_latent_nodes import NODE_DISPLAY_NAME_MAPPINGS as LATENT_DISPLAY_MAPPINGS
+except Exception as e:
+    print(f"[Eric_Hunyuan3] Warning: Could not load hunyuan_latent_nodes: {e}")
+
 # Combine all mappings
 NODE_CLASS_MAPPINGS = {
     **QUANTIZED_MAPPINGS,
@@ -75,6 +83,7 @@ NODE_CLASS_MAPPINGS = {
     **INSTRUCT_MAPPINGS,
     **HIGHRES_MAPPINGS,
     **MOE_TEST_MAPPINGS,
+    **LATENT_MAPPINGS,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -85,6 +94,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     **INSTRUCT_DISPLAY_MAPPINGS,
     **HIGHRES_DISPLAY_MAPPINGS,
     **MOE_TEST_DISPLAY_MAPPINGS,
+    **LATENT_DISPLAY_MAPPINGS,
 }
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']

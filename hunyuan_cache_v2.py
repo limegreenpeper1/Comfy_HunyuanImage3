@@ -451,13 +451,23 @@ class ModelCacheV2:
         except Exception:
             pass
         
-        # Step 5: Remove accelerate hooks
+        # Step 5: Remove accelerate hooks.
+        # Also clean up instance-level `forward` attributes left by
+        # remove_hook_from_module — they shadow the class method and
+        # would be found by Step 5a's monkey-patch scanner, which could
+        # (before the type guard fix) nuke their __class__ closure cell.
         if cached.model is not None:
             try:
                 from accelerate.hooks import remove_hook_from_module
                 for name, module in cached.model.named_modules():
                     if hasattr(module, '_hf_hook'):
                         remove_hook_from_module(module)
+                    # Clean up stale instance-level forward left by hook removal
+                    if 'forward' in vars(module):
+                        try:
+                            delattr(module, 'forward')
+                        except Exception:
+                            pass
             except (ImportError, Exception):
                 pass
         
@@ -490,6 +500,20 @@ class ModelCacheV2:
                             closure = getattr(attr.__func__, '__closure__', None)
                         if closure:
                             for cell in closure:
+                                try:
+                                    _val = cell.cell_contents
+                                except ValueError:
+                                    continue
+                                # CRITICAL: never nuke __class__ cells.
+                                # Python stores the enclosing class in a
+                                # closure cell for zero-arg super(); the
+                                # cell lives on the class-level function
+                                # object and is shared by ALL instances.
+                                # Nuking it permanently breaks super()
+                                # for the entire class (including future
+                                # instances loaded via sys.modules).
+                                if isinstance(_val, type):
+                                    continue
                                 try:
                                     ctypes.pythonapi.PyCell_Set(
                                         ctypes.py_object(cell),

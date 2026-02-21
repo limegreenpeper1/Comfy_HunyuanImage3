@@ -408,6 +408,16 @@ class HunyuanImage3QuantizedLoader:
             "attn.out_proj",
             "self_attn",
             "cross_attn",
+            # MoE Gate/Router (CRITICAL - float32 by design, controls expert routing)
+            "mlp.gate",          # HunyuanTopKGate — routes tokens to experts
+            # Shared Expert (runs on ALL tokens, outsized quality impact)
+            "shared_mlp",        # Shared MLP expert, processes every token
+            # Embeddings & Output Head
+            "lm_head",           # Output projection
+            "model.wte",         # Word token embedding
+            "wte",               # Word token embedding (alternate path)
+            "model.ln_f",        # Final RMSNorm
+            "ln_f",              # Final RMSNorm (alternate path)
         ]
         quant_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -695,6 +705,16 @@ class HunyuanImage3Int8Loader:
             "attn.out_proj",
             "self_attn",
             "cross_attn",
+            # MoE Gate/Router (CRITICAL - float32 by design, controls expert routing)
+            "mlp.gate",          # HunyuanTopKGate — routes tokens to experts
+            # Shared Expert (runs on ALL tokens, outsized quality impact)
+            "shared_mlp",        # Shared MLP expert, processes every token
+            # Embeddings & Output Head
+            "lm_head",           # Output projection
+            "model.wte",         # Word token embedding
+            "wte",               # Word token embedding (alternate path)
+            "model.ln_f",        # Final RMSNorm
+            "ln_f",              # Final RMSNorm (alternate path)
         ]
         
         # Loading a PRE-QUANTIZED INT8 model (weights already quantized on disk)
@@ -1045,9 +1065,16 @@ class HunyuanImage3NF4LoaderLowVRAMBudget:
             "attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.o_proj",
             "attn.qkv_proj", "attn.out_proj",
             "self_attn", "cross_attn",
+            # MoE Gate/Router (CRITICAL - float32 by design)
+            "mlp.gate",
+            # Shared Expert (runs on ALL tokens)
+            "shared_mlp",
+            # Embeddings, norms & output head
             "norm", "model.norm",
             "lm_head", "model.lm_head",
             "embed_tokens", "model.embed_tokens",
+            "model.wte", "wte",
+            "model.ln_f", "ln_f",
         ]
 
         quant_config = BitsAndBytesConfig(
@@ -1231,9 +1258,16 @@ class HunyuanImage3NF4LoaderLowVRAMBudget:
             "attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.o_proj",
             "attn.qkv_proj", "attn.out_proj",
             "self_attn", "cross_attn",
+            # MoE Gate/Router (CRITICAL - float32 by design)
+            "mlp.gate",
+            # Shared Expert (runs on ALL tokens)
+            "shared_mlp",
+            # Embeddings, norms & output head
             "norm", "model.norm",
             "lm_head", "model.lm_head",
             "embed_tokens", "model.embed_tokens",
+            "model.wte", "wte",
+            "model.ln_f", "ln_f",
         ]
 
         quant_config = BitsAndBytesConfig(
@@ -1580,6 +1614,16 @@ class HunyuanImage3Int8LoaderBudget:
             "attn.out_proj",
             "self_attn",
             "cross_attn",
+            # MoE Gate/Router (CRITICAL - float32 by design, controls expert routing)
+            "mlp.gate",          # HunyuanTopKGate — routes tokens to experts
+            # Shared Expert (runs on ALL tokens, outsized quality impact)
+            "shared_mlp",        # Shared MLP expert, processes every token
+            # Embeddings & Output Head
+            "lm_head",           # Output projection
+            "model.wte",         # Word token embedding
+            "wte",               # Word token embedding (alternate path)
+            "model.ln_f",        # Final RMSNorm
+            "ln_f",              # Final RMSNorm (alternate path)
         ]
 
         logger.info("Detected INT8 selective quantization")

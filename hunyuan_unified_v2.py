@@ -235,13 +235,13 @@ class HunyuanUnifiedV2:
             },
             "optional": {
                 "blocks_to_swap": ("INT", {
-                    "default": -1, "min": -1, "max": 31, 
+                    "default": 20, "min": -1, "max": 31, 
                     "tooltip": "-1 = auto calculate. 0 = no swapping (NF4 needs ~50GB; BF16 uses device_map). 1-31 = manual swap count. BF16 with block swap loads to CPU and is much faster than device_map."}),
                 "vae_placement": (["auto", "always_gpu", "managed"], {
                     "default": "auto",
                     "tooltip": "auto: decide based on VRAM. always_gpu: VAE stays on GPU. managed: VAE moves to CPU when not decoding."}),
                 "post_action": (["keep_loaded", "soft_unload", "full_unload"], {
-                    "default": "keep_loaded",
+                    "default": "full_unload",
                     "tooltip": "keep_loaded: Keep model on GPU. soft_unload: Move to CPU, keep cached. full_unload: Remove from memory."}),
                 "enable_vae_tiling": ("BOOLEAN", {
                     "default": False,
@@ -436,8 +436,27 @@ class HunyuanUnifiedV2:
                            f"{vae_and_overhead:.0f}GB overhead = {inference_reserve:.0f}GB + "
                            f"{reserve_vram_gb:.0f}GB downstream = {total_reserve:.0f}GB total reserve")
         else:
-            # NF4/INT8 fit on GPU, use user-specified reserve only
-            total_reserve = reserve_vram_gb if reserve_vram_gb > 0 else 10.0
+            # NF4/INT8: calculate appropriate reserve
+            if quant_type == "int8" and blocks_to_swap != 0:
+                # INT8 block-swap mode: non-block components (~15GB) on GPU,
+                # blocks managed by BlockSwapManager. Need reserve for MoE
+                # dispatch_mask (~4-14GB) + inference activations.
+                dispatch_mask_gb = 5.0 + (megapixels * 2.0)  # Scales with resolution
+                activation_gb = 4.0 + (megapixels * 1.0)
+                vae_overhead = 3.0
+                inference_reserve = dispatch_mask_gb + activation_gb + vae_overhead
+                total_reserve = inference_reserve + reserve_vram_gb
+                logger.info(f"INT8 block-swap reserve for {megapixels:.1f}MP: "
+                           f"{dispatch_mask_gb:.0f}GB dispatch_mask + {activation_gb:.0f}GB activation + "
+                           f"{vae_overhead:.0f}GB VAE = {inference_reserve:.0f}GB + "
+                           f"{reserve_vram_gb:.0f}GB downstream = {total_reserve:.0f}GB total")
+            elif quant_type == "int8":
+                # INT8 direct-to-GPU mode: entire model on GPU,
+                # need more headroom for dispatch_mask + activations
+                total_reserve = reserve_vram_gb if reserve_vram_gb > 0 else 15.0
+            else:
+                # NF4 fits on GPU with room to spare
+                total_reserve = reserve_vram_gb if reserve_vram_gb > 0 else 10.0
             inference_reserve = 0.0
         
         # Check cache first
@@ -618,8 +637,8 @@ class HunyuanUnifiedV2:
         # Check if model supports block swapping
         can_swap = result.is_moveable
         if not can_swap and blocks_to_swap > 0:
-            logger.warning(f"{quant_type} model is not moveable (likely INT8 or BF16 with device_map)")
-            logger.warning("Block swapping disabled for this model type")
+            logger.warning(f"{quant_type} model is not moveable (loaded with device_map, no block swap)")
+            logger.warning("Block swapping disabled for this load configuration")
             blocks_to_swap = 0
         
         # Setup block swap manager
@@ -1047,14 +1066,14 @@ class HunyuanUnifiedV2:
         # Auto-detect quant type from model name
         quant_type = detect_quant_type(model_name)
         
-        # INT8 models use device_map and CANNOT use block swapping.
-        # BF16 models CAN use block swapping (load to CPU, BlockSwapManager).
+        # INT8 and BF16 models both support block swapping.
+        # INT8 block swap: load to CPU, BlockSwapManager handles GPU↔CPU transfers.
+        # Int8Params.to(device) fully supports movement for pre-quantized models.
+        # BF16 block swap: same approach, load to CPU + BlockSwapManager.
+        # When blocks_to_swap=0: INT8 loads directly to GPU, BF16 uses device_map="auto".
         if quant_type == "int8":
-            if blocks_to_swap != 0:
-                logger.info("INT8 model detected - forcing blocks_to_swap=0 (device_map models cannot block swap)")
-                blocks_to_swap = 0
-            if post_action == "soft_unload":
-                logger.info("INT8 model cannot soft_unload - using keep_loaded instead")
+            if blocks_to_swap == 0 and post_action == "soft_unload":
+                logger.info("INT8 model without block swap cannot soft_unload - using keep_loaded instead")
                 post_action = "keep_loaded"
         elif quant_type == "bf16":
             # BF16 supports block swap (load to CPU + BlockSwapManager).
@@ -1118,7 +1137,8 @@ class HunyuanUnifiedV2:
                 blocks_to_swap=blocks_to_swap,
                 vae_placement=vae_placement,
                 reserve_vram_gb=reserve_vram_gb,
-                device=device
+                device=device,
+                gb_per_block={"nf4": 0.75, "int8": 2.5, "bf16": 5.0}.get(quant_type, 1.22)
             )
             
             logger.info(f"Config: blocks_to_swap={final_blocks}, VAE={final_vae}")

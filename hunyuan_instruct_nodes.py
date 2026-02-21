@@ -1095,12 +1095,21 @@ class InstructModelCache:
                 except Exception:
                     pass
             
-            # Step 4: Remove any remaining accelerate hooks
+            # Step 4: Remove any remaining accelerate hooks.
+            # Also clean up instance-level `forward` attributes left by
+            # remove_hook_from_module — they shadow the class method and
+            # would be found by the cache-clear monkey-patch remover,
+            # which could nuke their __class__ closure cell.
             try:
                 from accelerate.hooks import remove_hook_from_module
                 for name, module in self.model.named_modules():
                     if hasattr(module, '_hf_hook'):
                         remove_hook_from_module(module)
+                    if 'forward' in vars(module):
+                        try:
+                            delattr(module, 'forward')
+                        except Exception:
+                            pass
             except ImportError:
                 pass
             except Exception:
@@ -1883,11 +1892,19 @@ class HunyuanInstructLoader:
             # Remove any accelerate dispatch hooks that device_map="cpu" may have installed.
             # With device_map="cpu", accelerate might install minimal hooks even though
             # everything is on CPU. Our block swap hooks replace them.
+            # Also clean up instance-level `forward` attributes left by hook removal
+            # to prevent the cache-clear monkey-patch remover from nuking their
+            # __class__ closure cell (which permanently breaks super()).
             try:
                 from accelerate.hooks import remove_hook_from_module
                 for name, module in model.named_modules():
                     if hasattr(module, '_hf_hook'):
                         remove_hook_from_module(module)
+                    if 'forward' in vars(module):
+                        try:
+                            delattr(module, 'forward')
+                        except Exception:
+                            pass
             except ImportError:
                 pass
             except Exception as e:

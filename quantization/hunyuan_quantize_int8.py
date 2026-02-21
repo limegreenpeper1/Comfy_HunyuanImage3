@@ -118,12 +118,23 @@ class HunyuanQuantizerINT8:
             "attn.out_proj",
             "self_attn",
             "cross_attn",
+            # === MoE Gate/Router (CRITICAL - float32 by design, controls expert routing) ===
+            "mlp.gate",          # HunyuanTopKGate — routes tokens to experts
+            # === Shared Expert (runs on ALL tokens, outsized quality impact) ===
+            "shared_mlp",        # Shared MLP expert, processes every token
+            # === Embeddings & Output Head ===
+            "lm_head",           # Output projection
+            "model.wte",         # Word token embedding
+            "wte",               # Word token embedding (alternate path)
+            "model.ln_f",        # Final RMSNorm
+            "ln_f",              # Final RMSNorm (alternate path)
         ]
 
         config = BitsAndBytesConfig(
             load_in_8bit=True,
             llm_int8_threshold=self.int8_threshold,  # Outlier detection threshold
             llm_int8_skip_modules=skip_modules,
+            llm_int8_enable_fp32_cpu_offload=True,  # CPU modules stay FP32 (avoids SCB bug)
         )
         
         logger.info("Created INT8 quantization config:")
@@ -131,12 +142,74 @@ class HunyuanQuantizerINT8:
         logger.info(f"  Outlier threshold: {self.int8_threshold}")
         logger.info(f"  Compute dtype: {self.compute_dtype}")
         logger.info(f"  Skipped modules: {len(skip_modules)} module patterns")
+        logger.info(f"  CPU offload: FP32 (avoids INT8 SCB serialization bug)")
         
         return config
     
+    def _compute_max_memory(self) -> Dict:
+        """
+        Compute max_memory budget for device_map='auto'.
+        
+        Accelerate's 'auto' device_map estimates module sizes at BF16
+        (before quantization) and overestimates memory, causing modules
+        to spill to CPU/disk. Since INT8 is ~1.7x smaller than BF16,
+        we inflate each GPU's budget by this factor so accelerate sees
+        enough room to keep everything on GPU.
+        
+        This approach:
+        - Works with 1, 2, 3+ GPUs of any size
+        - Handles asymmetric GPU memory automatically
+        - Doesn't require hardcoding module names
+        - Lets accelerate handle module discovery and placement
+        """
+        gpu_count = torch.cuda.device_count()
+        if gpu_count == 0:
+            raise RuntimeError(
+                "No CUDA GPUs detected. INT8 quantization requires at least one GPU."
+            )
+        
+        max_memory = {}
+        total_real_gb = 0
+        
+        for i in range(gpu_count):
+            props = torch.cuda.get_device_properties(i)
+            total_gb = props.total_memory / 1024**3
+            total_real_gb += total_gb
+            
+            # Reserve 8% for CUDA context, workspace buffers, fragmentation
+            usable_gb = total_gb * 0.92
+            
+            # Inflate by 1.7x to account for INT8 compression.
+            # Accelerate estimates sizes at BF16 (source dtype) but INT8
+            # reduces actual memory by ~40-50%. This tells accelerate
+            # the GPU has more room than it appears, preventing
+            # unnecessary CPU spillover.
+            # Factor 1.7 is conservative (actual ratio ~1.7-2.0x).
+            effective_gb = usable_gb * 1.7
+            
+            max_memory[i] = f"{int(effective_gb)}GiB"
+            logger.info(f"  GPU {i}: {props.name} — {total_gb:.1f} GB real, "
+                        f"budget {int(effective_gb)} GiB (inflated for INT8)")
+        
+        # Allow modest CPU fallback for edge cases (very small GPUs).
+        # With llm_int8_enable_fp32_cpu_offload=True, any CPU modules
+        # stay in FP32 and save correctly.
+        max_memory["cpu"] = "24GiB"
+        
+        logger.info(f"  Total real GPU memory: {total_real_gb:.0f} GB "
+                    f"across {gpu_count} GPU(s)")
+        logger.info(f"  max_memory: {max_memory}")
+        
+        return max_memory
+
     def load_and_quantize(self) -> AutoModelForCausalLM:
         """
         Load the model and apply INT8 quantization.
+        
+        Uses device_map='auto' with inflated max_memory budgets to
+        account for INT8 compression. This lets accelerate discover
+        and place all modules automatically while preventing
+        unnecessary CPU spillover.
         
         Returns:
             Quantized model ready for inference
@@ -147,31 +220,53 @@ class HunyuanQuantizerINT8:
         try:
             logger.info("Starting INT8 model quantization...")
             logger.info("This will take several minutes on first run...")
-            logger.info("Expected memory: ~95-100GB (will use CPU offload)")
+            logger.info("Expected memory: ~95-100GB across GPUs")
             
             # Create quantization config
             quant_config = self.create_quantization_config()
             
+            # Compute inflated memory budgets so accelerate's 'auto'
+            # device map keeps everything on GPU despite overestimating
+            # at BF16 sizes. Works with any number/size of GPUs.
+            max_memory = self._compute_max_memory()
+            
             # Load model with quantization
-            # Note: trust_remote_code=True is required for HunyuanImage-3.0
             logger.info(f"Loading model from {self.model_path}...")
             
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
                 quantization_config=quant_config,
-                device_map=self.device_map,
+                device_map="auto",
+                max_memory=max_memory,
                 trust_remote_code=True,
-                torch_dtype=torch.bfloat16,  # Base dtype for non-quantized parts
-                attn_implementation="sdpa",  # Use SDPA since FlashAttention may not work on Blackwell yet
+                torch_dtype=torch.bfloat16,
+                attn_implementation="sdpa",
             )
             
             logger.info("Model loaded and quantized successfully!")
             logger.info(f"Model device map: {model.hf_device_map}")
             
+            # Verify nothing ended up on CPU/meta
+            if hasattr(model, 'hf_device_map'):
+                cpu_modules = [
+                    k for k, v in model.hf_device_map.items()
+                    if v in ('cpu', 'disk')
+                ]
+                if cpu_modules:
+                    logger.warning(
+                        f"WARNING: {len(cpu_modules)} modules still on CPU: {cpu_modules}. "
+                        f"Save may fail."
+                    )
+                else:
+                    logger.info("All modules on GPU — save should succeed.")
+            
             # Get memory usage
             if torch.cuda.is_available():
-                mem_allocated = torch.cuda.max_memory_allocated() / 1024**3
-                logger.info(f"Peak GPU memory allocated: {mem_allocated:.2f} GB")
+                for i in range(torch.cuda.device_count()):
+                    allocated = torch.cuda.memory_allocated(i) / 1024**3
+                    total = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                    logger.info(f"GPU {i}: {allocated:.1f} / {total:.1f} GB "
+                                f"({allocated/total*100:.0f}% used)")
             
             return model
             

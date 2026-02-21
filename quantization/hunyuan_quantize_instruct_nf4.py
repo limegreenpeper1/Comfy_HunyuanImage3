@@ -136,6 +136,19 @@ class HunyuanInstructQuantizerNF4:
             "attn.out_proj",
             "self_attn",
             "cross_attn",
+            
+            # === MoE Gate/Router (CRITICAL - float32 by design, controls expert routing) ===
+            "mlp.gate",          # HunyuanTopKGate — routes tokens to experts
+            
+            # === Shared Expert (runs on ALL tokens, outsized quality impact) ===
+            "shared_mlp",        # Shared MLP expert, processes every token
+            
+            # === Embeddings & Output Head ===
+            "lm_head",           # Output projection
+            "model.wte",         # Word token embedding
+            "wte",               # Word token embedding (alternate path)
+            "model.ln_f",        # Final RMSNorm
+            "ln_f",              # Final RMSNorm (alternate path)
         ]
 
         config = BitsAndBytesConfig(

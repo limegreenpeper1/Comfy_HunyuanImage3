@@ -96,7 +96,7 @@ class MemoryBudget:
             "num_blocks": 32,
         },
         "int8": {
-            "weights_gb": 40.0,  # INT8 quantized
+            "weights_gb": 80.0,  # Pre-quantized INT8 (weights + SCB scales)
             "vae_gb": 3.0,
             "text_encoder_gb": 2.0,
             "num_blocks": 32,

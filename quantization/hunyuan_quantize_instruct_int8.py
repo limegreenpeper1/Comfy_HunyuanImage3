@@ -136,6 +136,19 @@ class HunyuanInstructQuantizerINT8:
             "attn.out_proj",
             "self_attn",
             "cross_attn",
+            
+            # === MoE Gate/Router (CRITICAL - float32 by design, controls expert routing) ===
+            "mlp.gate",          # HunyuanTopKGate — routes tokens to experts
+            
+            # === Shared Expert (runs on ALL tokens, outsized quality impact) ===
+            "shared_mlp",        # Shared MLP expert, processes every token
+            
+            # === Embeddings & Output Head ===
+            "lm_head",           # Output projection
+            "model.wte",         # Word token embedding
+            "wte",               # Word token embedding (alternate path)
+            "model.ln_f",        # Final RMSNorm
+            "ln_f",              # Final RMSNorm (alternate path)
         ]
 
         config = BitsAndBytesConfig(
@@ -155,74 +168,61 @@ class HunyuanInstructQuantizerINT8:
         
         return config
     
-    def _build_device_map(self) -> Dict[str, int]:
+    def _compute_max_memory(self) -> Dict:
         """
-        Build an explicit device_map that places ALL modules on GPU.
+        Compute max_memory budget for device_map='auto'.
         
         Accelerate's 'auto' device_map estimates module sizes at BF16
-        (before quantization) and overestimates memory needs, causing
-        modules to spill to CPU as meta tensors. Since INT8 is ~2x
-        smaller than BF16, the model actually fits entirely on GPU.
+        (before quantization) and overestimates memory, causing modules
+        to spill to CPU/disk. Since INT8 is ~1.7x smaller than BF16,
+        we inflate each GPU's budget by this factor so accelerate sees
+        enough room to keep everything on GPU.
         
-        This method reads the model config to determine the number of
-        layers, then distributes them proportionally across GPUs based
-        on available memory (accounting for non-layer overhead on GPU 0).
+        This approach:
+        - Works with 1, 2, 3+ GPUs of any size
+        - Handles asymmetric GPU memory automatically
+        - Doesn't require hardcoding module names
+        - Lets accelerate handle module discovery and placement
         """
-        config_path = Path(self.model_path) / "config.json"
-        with open(config_path) as f:
-            config = json.load(f)
-        
-        num_layers = config.get("num_hidden_layers", 32)
-        
-        # Get GPU memory
         gpu_count = torch.cuda.device_count()
-        gpu_memories = []
+        if gpu_count == 0:
+            raise RuntimeError(
+                "No CUDA GPUs detected. INT8 quantization requires at least one GPU."
+            )
+        
+        max_memory = {}
+        total_real_gb = 0
+        
         for i in range(gpu_count):
-            total = torch.cuda.get_device_properties(i).total_memory / 1024**3
-            gpu_memories.append(total)
-            logger.info(f"  GPU {i}: {total:.1f} GB")
-        
-        # Non-layer modules always go on GPU 0
-        device_map = {
-            "vae": 0,
-            "vision_model": 0,
-            "vision_aligner": 0,
-            "timestep_emb": 0,
-            "patch_embed": 0,
-            "time_embed": 0,
-            "final_layer": 0,
-            "time_embed_2": 0,
-            "model.wte": 0,
-            "model.ln_f": 0,
-            "lm_head": 0,
-        }
-        
-        if gpu_count == 1:
-            # Single GPU — all layers on GPU 0
-            for i in range(num_layers):
-                device_map[f"model.layers.{i}"] = 0
-        else:
-            # Multi-GPU — split layers proportionally.
-            # GPU 0 has ~15-20GB of non-layer overhead (VAE, vision, embeddings)
-            # so it gets fewer layers.
-            gpu0_overhead_gb = 20  # conservative estimate for non-layer modules
-            gpu0_available = gpu_memories[0] - gpu0_overhead_gb
-            gpu1_available = gpu_memories[1] if gpu_count > 1 else 0
-            total_available = gpu0_available + gpu1_available
+            props = torch.cuda.get_device_properties(i)
+            total_gb = props.total_memory / 1024**3
+            total_real_gb += total_gb
             
-            # Ratio of layers for GPU 0
-            gpu0_ratio = gpu0_available / total_available
-            split_point = int(num_layers * gpu0_ratio)
-            # Ensure at least a few layers on each GPU
-            split_point = max(4, min(split_point, num_layers - 4))
+            # Reserve 8% for CUDA context, workspace buffers, fragmentation
+            usable_gb = total_gb * 0.92
             
-            logger.info(f"  Layer split: GPU 0 gets layers 0-{split_point-1}, "
-                        f"GPU 1 gets layers {split_point}-{num_layers-1}")
+            # Inflate by 1.7x to account for INT8 compression.
+            # Accelerate estimates sizes at BF16 (source dtype) but INT8
+            # reduces actual memory by ~40-50%. This tells accelerate
+            # the GPU has more room than it appears, preventing
+            # unnecessary CPU spillover.
+            # Factor 1.7 is conservative (actual ratio ~1.7-2.0x).
+            effective_gb = usable_gb * 1.7
             
-            for i in range(num_layers):
-                device_map[f"model.layers.{i}"] = 0 if i < split_point else 1
+            max_memory[i] = f"{int(effective_gb)}GiB"
+            logger.info(f"  GPU {i}: {props.name} \u2014 {total_gb:.1f} GB real, "
+                        f"budget {int(effective_gb)} GiB (inflated for INT8)")
         
-        return device_map
+        # Allow modest CPU fallback for edge cases (very small GPUs).
+        # With llm_int8_enable_fp32_cpu_offload=True, any CPU modules
+        # stay in FP32 and save correctly.
+        max_memory["cpu"] = "24GiB"
+        
+        logger.info(f"  Total real GPU memory: {total_real_gb:.0f} GB "
+                    f"across {gpu_count} GPU(s)")
+        logger.info(f"  max_memory: {max_memory}")
+        
+        return max_memory
 
     def load_and_quantize(self) -> AutoModelForCausalLM:
         """
@@ -245,11 +245,10 @@ class HunyuanInstructQuantizerINT8:
             # Create quantization config
             quant_config = self.create_quantization_config()
             
-            # Build explicit device_map — accelerate's 'auto' overestimates
-            # at BF16 sizes and spills to CPU as meta tensors that can't be saved.
-            # The INT8 model is ~76GB and fits entirely on GPU.
-            device_map = self._build_device_map()
-            logger.info(f"Explicit device map: {device_map}")
+            # Compute inflated memory budgets so accelerate's 'auto'
+            # device map keeps everything on GPU despite overestimating
+            # at BF16 sizes. Works with any number/size of GPUs.
+            max_memory = self._compute_max_memory()
             
             # Load model with quantization
             logger.info(f"Loading Instruct model from {self.model_path}...")
@@ -257,7 +256,8 @@ class HunyuanInstructQuantizerINT8:
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
                 quantization_config=quant_config,
-                device_map=device_map,
+                device_map="auto",
+                max_memory=max_memory,
                 trust_remote_code=True,
                 torch_dtype=torch.bfloat16,
                 attn_implementation="sdpa",

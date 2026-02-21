@@ -6,18 +6,19 @@
 
 Professional ComfyUI custom nodes for [Tencent HunyuanImage-3.0](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0), the powerful 80B parameter native multimodal image generation model.
 
-> **Latest — v1.2.0**
-> - 🎨 **Instruct Resolution Overhaul**: All 33 model-native bucket resolutions now available in the dropdown — from 512×2048 (1:4 Tall) through 1024×1024 (1:1 Square) to 2048×512 (4:1 Wide). Ordered tallest portrait → square → widest landscape.
-> - 🔀 **Multi-Image Fusion expanded to 5 inputs**: Image slots 4 and 5 added as experimental inputs (model officially supports 3, but the pipeline accepts more).
-> - 🛡️ **Transformers 5.x compatibility**: All `_lookup` dict guard, `BitsAndBytesConfig` import, and `modeling_utils` attribute checks updated for forward compatibility.
-> - 🐛 **NF4 Low VRAM OOM fix** (Issue #16): Two-stage `max_memory` estimation replaces the one-shot approach that left no headroom for inference.
-> - 🐛 **Multi-GPU device mismatch fix** (Issue #15): Explicit `.to(device)` calls on `freqs_cis` / `image_pos_id` prevent cross-device errors during block-swap.
-> - 🧹 **Code quality pass**: Dead imports removed, missing OOM handlers added to Instruct nodes, multi-GPU block-swap patch applied consistently.
+> **Latest — v1.3.0**
+> - ✅ **Instruct (full) INT8 now working**: Five bugs fixed — INT8 block swap, CB/SCB device tracking, memory budget estimation, and VAE decode `super()` crash caused by closure cell corruption. All Instruct INT8 variants (Distil and full) are fully operational.
+> - 📦 **v2 pre-quantized models on Hugging Face**: Improved quantization with better block swap defaults. Available for all 6 base + Instruct variants (INT8 and NF4). See [download links](#available-models-on-hugging-face) below.
+> - 🧪 **Experimental latent/image input nodes** (base models): `Hunyuan Empty Latent`, `Hunyuan Latent Noise Shaping`, and `Hunyuan Generate with Latent` provide composition control, img2img, and custom noise injection for the base (non-Instruct) pipeline. See [Latent Control Nodes](#-latent-control-nodes-experimental).
+> - 🛠️ **Unified Generate V2 node**: Single node replaces all base-model generate variants — auto-detects NF4/INT8/BF16, handles block swap, memory budgets, and VRAM management.
 >
-> **Previous highlights:**
+> **Previous highlights (v1.2.0):**
+> - 🎨 Instruct resolution overhaul — all 33 model-native bucket resolutions.
+> - 🔀 Multi-Image Fusion expanded to 5 inputs.
+> - 🛡️ Transformers 5.x compatibility. NF4 Low VRAM OOM fix (Issue #16). Multi-GPU device mismatch fix (Issue #15).
 > - 🚀 **HighRes Efficient generate node** enables 3MP–4K+ generation on 96GB GPUs by replacing the memory-hungry MoE dispatch_mask with a loop-based expert routing that uses ~75× less VRAM. See [High-Resolution Generation](#-high-resolution-generation-highres-efficient) below.
 > - ✅ **NF4 Low VRAM Loader + Low VRAM Budget generator are verified on 24‑32 GB cards** thanks to the custom device-map strategy that pins every quantized layer on GPU.
-> - ✅ **INT8 Budget loader works end-to-end** and a pre-quantized checkpoint is available on Hugging Face: [EricRollei/Hunyuan_Image_3_Int8](https://huggingface.co/EricRollei/Hunyuan_Image_3_Int8) for anyone who wants INT8 quality without running the quantizer locally.
+> - ✅ **INT8 Budget loader works end-to-end** and pre-quantized checkpoints are available on Hugging Face.
 > - 📸 Added a reference workflow (below) showing the recommended node pair for Low VRAM setups.
 
 > **🙏 Acknowledgment**: This project integrates the HunyuanImage-3.0 model developed by **Tencent Hunyuan Team** and uses their official system prompts. The model and original code are licensed under [Apache 2.0](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE). This integration code is separately licensed under CC BY-NC 4.0 for non-commercial use.
@@ -27,9 +28,11 @@ Professional ComfyUI custom nodes for [Tencent HunyuanImage-3.0](https://github.
 - [x] **NF4 Low VRAM Loader**: Custom device map keeps NF4 layers on GPU so 24‑32 GB cards can use the Low VRAM Budget workflow without bitsandbytes errors.
 - [x] Provide example workflow/screenshot for Low VRAM users (see below).- [x] **Instruct nodes**: Loader, Generate, Image Edit, Multi-Image Fusion, and Unload nodes for Instruct models.
 - [x] **Instruct block swap**: BF16, INT8, and NF4 Distil models verified working with block swap.
-- [ ] **Instruct non-distil INT8**: OOM under investigation — the full (non-distilled) Instruct INT8 model with block swap currently fails during inference. Distil-INT8 works fine. See [Known Limitations](#known-limitations) below.- [ ] Add screenshots/documentation for every node (in progress).
+- [x] **Instruct non-distil INT8**: ✅ Fixed in v1.3.0. Five bugs resolved: (1) `blocks_to_swap` forced to 0 for INT8, (2) missing `_load_int8_block_swap()` method, (3) INT8 model size estimated at 40GB instead of 80GB, (4) CB/SCB not fixed after `.to(device)`, (5) wrong `gb_per_block` for INT8 in optimal config. Plus VAE decode `super()` crash from closure cell corruption.
+- [ ] Add screenshots/documentation for every node (in progress).
 - [ ] Test and document multi-GPU setup.
 - [ ] Continue long-run stability testing on the INT8 Budget loader with CPU offload edge cases.
+- [ ] **LoRA loading support**: Load pre-trained PEFT LoRA adapters for inference (merge-and-unload or live adapter swapping). Shelved until the HunyuanImage-3.0 LoRA ecosystem matures — only a handful of LoRAs exist currently. See [PhotonAISG/hunyuan-image3-finetune](https://github.com/PhotonAISG/hunyuan-image3-finetune) for training scripts.
 
 ## 🎯 Features
 
@@ -124,7 +127,7 @@ Both variants are available in BF16, INT8, and NF4 quantization.
 | Instruct-Distil | INT8 | ~81 GB | 96 GB | Required | ✅ Working |
 | Instruct-Distil | BF16 | ~160 GB | 96 GB | Required | ✅ Working |
 | Instruct (full) | NF4 | ~45 GB | 48 GB | Optional | ✅ Working |
-| Instruct (full) | INT8 | ~81 GB | 96 GB | Required | ⚠️ Under investigation |
+| Instruct (full) | INT8 | ~81 GB | 96 GB | Required | ✅ Working |
 | Instruct (full) | BF16 | ~160 GB | 96 GB | Required | ✅ Working |
 
 ### Quick Install
@@ -152,22 +155,26 @@ huggingface-cli download tencent/HunyuanImage-3.0 --local-dir HunyuanImage-3
 
 **Option B: Download Pre-Quantized NF4 Model (~20GB)** - *Recommended for single GPU <96GB*
 You can download the pre-quantized weights directly from Hugging Face:
-[EricRollei/HunyuanImage-3-NF4-ComfyUI](https://huggingface.co/EricRollei/HunyuanImage-3-NF4-ComfyUI)
+
+- **v2 (recommended)**: [EricRollei/HunyuanImage-3-NF4-v2](https://huggingface.co/EricRollei/HunyuanImage-3-NF4-v2) — improved quantization with better block swap defaults
+- **v1**: [EricRollei/HunyuanImage-3-NF4-ComfyUI](https://huggingface.co/EricRollei/HunyuanImage-3-NF4-ComfyUI)
 
 ```bash
-# Download to ComfyUI/models/
+# Download v2 (recommended) to ComfyUI/models/
 cd ../../models
-huggingface-cli download EricRollei/HunyuanImage-3-NF4-ComfyUI --local-dir HunyuanImage-3-NF4
+huggingface-cli download EricRollei/HunyuanImage-3-NF4-v2 --local-dir HunyuanImage-3-NF4-v2
 ```
 
 **Option C: Download Pre-Quantized INT8 Model (~85GB)**
 If you want maximum fidelity without running the INT8 quantizer locally, grab the ready-to-go checkpoint:
-[EricRollei/Hunyuan_Image_3_Int8](https://huggingface.co/EricRollei/Hunyuan_Image_3_Int8)
+
+- **v2 (recommended)**: [EricRollei/HunyuanImage-3-INT8-v2](https://huggingface.co/EricRollei/HunyuanImage-3-INT8-v2) — improved quantization with better block swap defaults
+- **v1**: [EricRollei/Hunyuan_Image_3_Int8](https://huggingface.co/EricRollei/Hunyuan_Image_3_Int8)
 
 ```bash
-# Download to ComfyUI/models/
+# Download v2 (recommended) to ComfyUI/models/
 cd ../../models
-huggingface-cli download EricRollei/Hunyuan_Image_3_Int8 --local-dir HunyuanImage-3-INT8
+huggingface-cli download EricRollei/HunyuanImage-3-INT8-v2 --local-dir HunyuanImage-3-INT8-v2
 ```
 
 **Option D: Quantize Yourself (from Full Model)**
@@ -182,18 +189,18 @@ python hunyuan_quantize_nf4.py \
 
 **Option E: Download Instruct Models**
 
-Download Instruct models into your `ComfyUI/models/` directory so the loader can find them automatically. Pre-quantized INT8 and NF4 variants are available from [EricRollei on Hugging Face](https://huggingface.co/EricRollei):
+Download Instruct models into your `ComfyUI/models/` directory so the loader can find them automatically. Pre-quantized INT8 and NF4 variants (v2 recommended) are available from [EricRollei on Hugging Face](https://huggingface.co/EricRollei):
 
 ```bash
 cd ComfyUI/models
 
-# Pre-quantized INT8 Instruct-Distil (~81GB) — RECOMMENDED for 96GB GPUs
-huggingface-cli download EricRollei/HunyuanImage-3.0-Instruct-Distil-INT8 \
-  --local-dir HunyuanImage-3.0-Instruct-Distil-INT8
+# Pre-quantized INT8 Instruct-Distil v2 (~81GB) — RECOMMENDED for 96GB GPUs
+huggingface-cli download EricRollei/HunyuanImage-3.0-Instruct-Distil-INT8-v2 \
+  --local-dir HunyuanImage-3.0-Instruct-Distil-INT8-v2
 
-# Pre-quantized NF4 Instruct-Distil (~45GB) — for 48GB GPUs
-huggingface-cli download EricRollei/HunyuanImage-3.0-Instruct-Distil-NF4 \
-  --local-dir HunyuanImage-3.0-Instruct-Distil-NF4
+# Pre-quantized NF4 Instruct-Distil v2 (~45GB) — for 48GB GPUs
+huggingface-cli download EricRollei/HunyuanImage-3.0-Instruct-Distil-NF4-v2 \
+  --local-dir HunyuanImage-3.0-Instruct-Distil-NF4-v2
 ```
 
 See [Instruct Models](#-instruct-models-new) for the full list, HF links, and extra_model_paths.yaml setup for custom locations.
@@ -389,7 +396,7 @@ Block swap enables running large models on GPUs that can't fit the entire model.
 | Instruct-Distil INT8 | 24 | ~30 GB | ✅ Tested, working on 96 GB |
 | Instruct-Distil BF16 | 22 | ~50 GB | ✅ Tested, working on 96 GB |
 | Instruct (full) NF4 | 0 | ~29 GB | Fits on 48 GB without swap |
-| Instruct (full) INT8 | 28-31 | ~10-17 GB | ⚠️ Under investigation — OOM during inference |
+| Instruct (full) INT8 | 28-31 | ~10-17 GB | ✅ Working — fixed in v1.3.0 |
 | Instruct (full) BF16 | 22 | ~50 GB | ✅ Tested, working on 96 GB |
 
 ### Bot Task Modes
@@ -501,10 +508,14 @@ comfyui:
 
 | Model | Size | Link | Notes |
 |-------|------|------|-------|
-| Instruct-Distil INT8 | ~81 GB | [EricRollei/HunyuanImage-3.0-Instruct-Distil-INT8](https://huggingface.co/EricRollei/HunyuanImage-3.0-Instruct-Distil-INT8) | ⭐ Recommended — 8-step, fast |
-| Instruct-Distil NF4 | ~45 GB | [EricRollei/HunyuanImage-3.0-Instruct-Distil-NF4](https://huggingface.co/EricRollei/HunyuanImage-3.0-Instruct-Distil-NF4) | Best for 48 GB GPUs |
-| Instruct (full) INT8 | ~81 GB | [EricRollei/HunyuanImage-3.0-Instruct-INT8](https://huggingface.co/EricRollei/HunyuanImage-3.0-Instruct-INT8) | ⚠️ Under investigation |
-| Instruct (full) NF4 | ~45 GB | [EricRollei/HunyuanImage-3.0-Instruct-NF4](https://huggingface.co/EricRollei/HunyuanImage-3.0-Instruct-NF4) | 50-step, highest quality |
+| Instruct-Distil INT8 v2 | ~81 GB | [EricRollei/HunyuanImage-3.0-Instruct-Distil-INT8-v2](https://huggingface.co/EricRollei/HunyuanImage-3.0-Instruct-Distil-INT8-v2) | ⭐ Recommended — 8-step, fast |
+| Instruct-Distil NF4 v2 | ~45 GB | [EricRollei/HunyuanImage-3.0-Instruct-Distil-NF4-v2](https://huggingface.co/EricRollei/HunyuanImage-3.0-Instruct-Distil-NF4-v2) | Best for 48 GB GPUs |
+| Instruct (full) INT8 v2 | ~81 GB | [EricRollei/HunyuanImage-3.0-Instruct-INT8-v2](https://huggingface.co/EricRollei/HunyuanImage-3.0-Instruct-INT8-v2) | ✅ Working |
+| Instruct (full) NF4 v2 | ~45 GB | [EricRollei/HunyuanImage-3.0-Instruct-NF4-v2](https://huggingface.co/EricRollei/HunyuanImage-3.0-Instruct-NF4-v2) | 50-step, highest quality |
+| Instruct-Distil INT8 (v1) | ~81 GB | [EricRollei/HunyuanImage-3.0-Instruct-Distil-INT8](https://huggingface.co/EricRollei/HunyuanImage-3.0-Instruct-Distil-INT8) | Legacy |
+| Instruct-Distil NF4 (v1) | ~45 GB | [EricRollei/HunyuanImage-3.0-Instruct-Distil-NF4](https://huggingface.co/EricRollei/HunyuanImage-3.0-Instruct-Distil-NF4) | Legacy |
+| Instruct (full) INT8 (v1) | ~81 GB | [EricRollei/HunyuanImage-3.0-Instruct-INT8](https://huggingface.co/EricRollei/HunyuanImage-3.0-Instruct-INT8) | Legacy |
+| Instruct (full) NF4 (v1) | ~45 GB | [EricRollei/HunyuanImage-3.0-Instruct-NF4](https://huggingface.co/EricRollei/HunyuanImage-3.0-Instruct-NF4) | Legacy |
 | Instruct BF16 (full) | ~160 GB | [tencent/HunyuanImage-3.0-Instruct](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct) | Tencent original |
 | Instruct-Distil BF16 | ~160 GB | [tencent/HunyuanImage-3.0-Instruct-Distil](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) | Tencent original |
 
@@ -515,17 +526,21 @@ Download directly into `ComfyUI/models/`:
 ```bash
 cd ComfyUI/models
 
-# INT8 Instruct-Distil (~81GB) — RECOMMENDED for 96GB GPUs
-huggingface-cli download EricRollei/HunyuanImage-3.0-Instruct-Distil-INT8 \
-  --local-dir HunyuanImage-3.0-Instruct-Distil-INT8
+# INT8 Instruct-Distil v2 (~81GB) — RECOMMENDED for 96GB GPUs
+huggingface-cli download EricRollei/HunyuanImage-3.0-Instruct-Distil-INT8-v2 \
+  --local-dir HunyuanImage-3.0-Instruct-Distil-INT8-v2
 
-# NF4 Instruct-Distil (~45GB) — for 48GB GPUs
-huggingface-cli download EricRollei/HunyuanImage-3.0-Instruct-Distil-NF4 \
-  --local-dir HunyuanImage-3.0-Instruct-Distil-NF4
+# NF4 Instruct-Distil v2 (~45GB) — for 48GB GPUs
+huggingface-cli download EricRollei/HunyuanImage-3.0-Instruct-Distil-NF4-v2 \
+  --local-dir HunyuanImage-3.0-Instruct-Distil-NF4-v2
 
-# NF4 Instruct Full (~45GB)
-huggingface-cli download EricRollei/HunyuanImage-3.0-Instruct-NF4 \
-  --local-dir HunyuanImage-3.0-Instruct-NF4
+# NF4 Instruct Full v2 (~45GB)
+huggingface-cli download EricRollei/HunyuanImage-3.0-Instruct-NF4-v2 \
+  --local-dir HunyuanImage-3.0-Instruct-NF4-v2
+
+# INT8 Instruct Full v2 (~81GB) — now fully working
+huggingface-cli download EricRollei/HunyuanImage-3.0-Instruct-INT8-v2 \
+  --local-dir HunyuanImage-3.0-Instruct-INT8-v2
 
 # BF16 originals from Tencent (~160GB each)
 huggingface-cli download tencent/HunyuanImage-3.0-Instruct \
@@ -551,7 +566,7 @@ python hunyuan_quantize_instruct_distil_nf4.py \
 
 ### Known Limitations
 
-1. **Instruct (full) INT8 with block swap** — The non-distilled INT8 model currently OOMs during inference when using block swap. The Distil-INT8 variant works fine. The root cause is under investigation (the full Instruct model uses CFG with batch=2, which significantly increases intermediate tensor sizes during MoE routing). **Workaround**: Use Instruct-Distil-INT8 instead, or Instruct (full) BF16 with block swap.
+1. **INT8 block swap on Windows** — On Windows WDDM, pinned CPU memory (`cudaHostAlloc`) is mapped into the GPU’s address space and `cuMemGetInfo` counts it as consumed GPU memory. With 28 blocks × ~2.4GB = ~67GB of pinned buffers, this can exhaust a 96GB GPU. The fix skips pinned buffers for INT8 and uses `block.to()` instead (same approach as NF4). Additionally, `weight.CB` and `weight.data` are aliased to prevent memory doubling on GPU. **Tradeoff**: Without pinned buffers, CRT heap fragmentation may cause slow RAM growth over many generations on Windows. For INT8 Instruct-Distil on a 96GB GPU where the model fits without block swap, use `blocks_to_swap=0` for best performance.
 
 2. **Block swap requires `blocks_to_swap > 0` in the loader** — Setting it to 0 disables block swap entirely. For BF16/INT8 Instruct models, block swap is effectively required on 96 GB GPUs.
 
@@ -685,11 +700,78 @@ These generator settings never remap the model by themselves—they only influen
 | **Hunyuan 3 Loader (NF4)** | **Hunyuan 3 Generate** | Keeps model on GPU. Best for standard sizes (<2MP). |
 | **Hunyuan 3 Loader (Full BF16)** | **Hunyuan 3 Generate (Large/Offload)** | Keeps model in RAM. Allows CPU offloading for massive images (4K+). |
 | **Hunyuan 3 Loader (Full BF16)** | **Hunyuan 3 Generate (HighRes Efficient)** | Memory-efficient MoE for 3MP+ on 96GB GPUs. |
+| **Hunyuan Unified Generate V2** | *(built-in loader)* | Single node — auto-detects NF4/INT8/BF16, handles block swap and memory. |
+| **Hunyuan Generate with Latent** | *(built-in loader, inherits V2)* | 🧪 Experimental — adds image/latent inputs for composition, img2img, noise shaping. |
 | **Hunyuan Instruct Loader** | **Hunyuan Instruct Generate** | T2I with CoT reasoning and prompt enhancement. |
 | **Hunyuan Instruct Loader** | **Hunyuan Instruct Image Edit** | Edit images with natural language. |
 | **Hunyuan Instruct Loader** | **Hunyuan Instruct Multi-Image Fusion** | Combine 2–5 reference images (4–5 experimental). |
 
 > **Do not mix them!** Base model loaders are NOT compatible with Instruct generate nodes (and vice versa). The NF4 Loader with the Large/Offload node will also cause errors because the quantized model cannot be moved to CPU correctly.
+
+---
+
+### 🧪 Latent Control Nodes (Experimental)
+
+These nodes provide composition control, img2img, and custom noise injection for **base (non-Instruct) models**. They are experimental — the HunyuanImage-3 architecture is autoregressive (not diffusion-based), so traditional latent manipulation behaves differently than with Stable Diffusion.
+
+#### Latent Node Overview
+
+| Node | Purpose | Category |
+|------|---------|----------|
+| **Hunyuan Empty Latent** | Create a random noise tensor at a specific resolution and seed | Latent utility |
+| **Hunyuan Latent Noise Shaping** | Transform latent tensors — frequency filter, amplify, invert | Latent utility |
+| **Hunyuan Generate with Latent** | All-in-one generate node with optional image and latent inputs | Generate (inherits V2 Unified) |
+
+#### Hunyuan Generate with Latent
+
+This node extends the **Unified Generate V2** — it inherits all memory management, block swap, model loading, and VRAM features. On top of that, it adds two optional inputs:
+
+| Optional Input | What It Does |
+|----------------|--------------|
+| `image` | A ComfyUI IMAGE tensor — encoded to latent space via the model's VAE, then combined with noise according to `image_mode` |
+| `latent` | A `HUNYUAN_LATENT` tensor from Empty Latent or Noise Shaping — used as the noise source instead of random generation |
+
+**Image Modes** (when an image is connected):
+
+| Mode | Description | Best For |
+|------|-------------|----------|
+| `composition` | Extracts broad spatial layout from the image (low-pass filter in latent space) and modulates noise amplitude. **No ghosting** — only macro composition transfers. | Guiding where subjects/backgrounds appear |
+| `img2img` | Traditional latent mix: `(1−σ)·clean + σ·noise`. Low denoise preserves the image; high denoise adds variation. Can ghost at low denoise. | Classic image-to-image workflows |
+| `energy_map` | Uses per-channel energy (absolute magnitude) of the image latent to scale noise spatially. More abstract than composition. | Abstract/artistic noise shaping |
+
+**Usage Modes** (determined by which optional inputs are connected):
+
+| Image | Latent | Behavior |
+|:-----:|:------:|----------|
+| ❌ | ❌ | Identical to V2 Unified (pure text-to-image) |
+| ✅ | ❌ | Image-guided generation using `image_mode` |
+| ❌ | ✅ | Custom noise / latent injection |
+| ✅ | ✅ | Image-guided with custom noise base |
+
+#### Example Workflow: Image-Guided Composition
+
+```
+┌──────────────┐
+│ Load Image   │
+└──────┬───────┘
+       │ IMAGE
+       ▼
+┌──────────────────────────────────────────┐
+│ Hunyuan Generate with Latent             │
+│  model_name: HunyuanImage-3-NF4-v2      │
+│  prompt: "A cyberpunk cityscape..."      │
+│  image_mode: composition                 │
+│  denoise_strength: 0.5                   │
+│  resolution: 1024x1024                   │
+└───────────┬──────────────────────────────┘
+            │ IMAGE
+            ▼
+     ┌──────────────┐
+     │ Save Image   │
+     └──────────────┘
+```
+
+> **Note**: Because HunyuanImage-3 is autoregressive, img2img results differ significantly from diffusion-model img2img. The `composition` mode is generally recommended for more predictable layout guidance.
 
 ### Basic Workflow
 
@@ -1147,6 +1229,30 @@ Copyright (c) 2025-2026 Eric Hiss. All rights reserved.
 - **Tencent Official**: [WeChat](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/assets/WECHAT.md) | [Discord](https://discord.gg/ehjWMqF5wY)
 
 ## 🔄 Changelog
+
+### v1.3.0 (2026-02-12)
+
+**INT8 Instruct Fix (5 bugs):**
+- `blocks_to_swap` was forcibly set to 0 for INT8 models in `generate()` — now respects user setting
+- Missing `_load_int8_block_swap()` method in loader — added INT8-specific block swap loading with CB/SCB guard hooks
+- INT8 model size estimated at 40GB instead of 80GB in memory budget — corrected
+- `_move_non_block_components_to_gpu()` didn't fix INT8 CB/SCB after `.to(device)` — now calls `_fix_int8_module_devices()`
+- `_calculate_optimal_config()` used BF16's `gb_per_block` for INT8 — now uses quant-specific values (NF4: 0.72, INT8: 2.4, BF16: 4.7)
+
+**VAE Decode Crash Fix:**
+- Fixed `super(): __class__ is not a type (NoneType)` crash during VAE decode. Root cause: the cache-clearing code's "external monkey-patch remover" used `PyCell_Set(cell, None)` to nuke ALL closure cells, including `__class__` cells used by `super()` in Conv3d and other classes. Fixed with `isinstance(val, type)` guard in `hunyuan_shared.py` and `hunyuan_cache_v2.py`.
+- Cleaned up instance-level `forward` attributes left by `remove_hook_from_module` across 4 files.
+
+**v2 Pre-Quantized Models:**
+- All 6 INT8/NF4 models (base + Instruct-Distil + Instruct-Full) re-quantized and uploaded to Hugging Face with improved model cards and block swap guidance.
+
+**Experimental Latent Control Nodes:**
+- `Hunyuan Empty Latent` — creates random noise tensors at specific resolution/seed
+- `Hunyuan Latent Noise Shaping` — frequency filtering, amplification, inversion of latent tensors
+- `Hunyuan Generate with Latent` — all-in-one node with optional image/latent inputs for composition control, img2img, and energy map modes
+
+**Unified Generate V2:**
+- Single node replacing all base-model generate variants — auto-detects NF4/INT8/BF16, handles block swap, memory budgets, and VRAM management
 
 ### v1.2.0 (2026-02-11)
 
