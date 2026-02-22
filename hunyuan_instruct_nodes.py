@@ -2147,6 +2147,46 @@ class HunyuanInstructLoader:
                 model.vae.decode = _patched_vae_decode.__get__(model.vae, type(model.vae))
                 logger.info("  ✓ Patched VAE decode for float32->float16 conversion")
 
+            # CRITICAL: Patch VAE encode for MPS dtype compatibility
+            # The VAE encode (used in image editing) may also receive float32 inputs
+            if hasattr(model, 'vae') and hasattr(model.vae, 'encode'):
+                original_vae_encode = model.vae.encode
+
+                def _patched_vae_encode(self, *args, **kwargs):
+                    # Convert float32 inputs to float16 for MPS compatibility
+                    new_args = []
+                    for arg in args:
+                        if isinstance(arg, torch.Tensor) and arg.dtype == torch.float32:
+                            new_args.append(arg.to(dtype=torch.float16))
+                        else:
+                            new_args.append(arg)
+
+                    # Also convert float32 tensors in kwargs
+                    new_kwargs = {}
+                    for k, v in kwargs.items():
+                        if isinstance(v, torch.Tensor) and v.dtype == torch.float32:
+                            new_kwargs[k] = v.to(dtype=torch.float16)
+                        else:
+                            new_kwargs[k] = v
+
+                    return original_vae_encode(*new_args, **new_kwargs)
+
+                model.vae.encode = _patched_vae_encode.__get__(model.vae, type(model.vae))
+                logger.info("  ✓ Patched VAE encode for float32->float16 conversion")
+
+            # CRITICAL: Fix typo in image_processor method name
+            # The model code calls `build_img_ratio_slice_logits_proc` but the actual
+            # method name is `build_img_ratio_slice_logits_processor` (with "or" at end)
+            if hasattr(model, 'image_processor'):
+                attr_name_wrong = 'build_img_ratio_slice_logits_proc'
+                attr_name_correct = 'build_img_ratio_slice_logits_processor'
+
+                if hasattr(model.image_processor, attr_name_correct):
+                    # Add alias with wrong name to correct method
+                    setattr(model.image_processor, attr_name_wrong,
+                            getattr(model.image_processor, attr_name_correct))
+                    logger.info("  ✓ Patched image_processor method name typo (proc -> processor)")
+
             logger.info("  ✓ MPS dtype patches applied")
         
         # Setup block swap for models with blocks_to_swap > 0
