@@ -18,6 +18,11 @@ import torch
 from torch import nn
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
+try:
+    from .hunyuan_device import get_device_manager, is_mps_available, is_cuda_available
+except ImportError:
+    from hunyuan_device import get_device_manager, is_mps_available, is_cuda_available
+
 logger = logging.getLogger(__name__)
 
 
@@ -266,7 +271,113 @@ class CleanModelLoader:
         
         logger.info(f"Model loaded in {elapsed:.1f}s: {result}")
         return result
-    
+
+    @classmethod
+    def _load_bf16_mps(
+        cls,
+        model_path: str,
+        device: str,
+    ) -> LoadResult:
+        """
+        Load BF16 model on MPS (Apple Silicon) with unified memory.
+
+        MPS-specific loading path for Apple Silicon Macs (M1/M2/M3/M4 Ultra).
+        With 512GB unified memory, the entire BF16 model (~160GB) can fit
+        without block swap or device_map.
+
+        Key differences from CUDA path:
+        - No device_map="auto" needed (512GB unified memory > 160GB model)
+        - Load directly to MPS device
+        - Use float16 (MPS doesn't support bfloat16, but float16 is efficient)
+        - Block swap disabled
+
+        Args:
+            model_path: Path to model directory
+            device: Target device (should be "mps")
+
+        Returns:
+            LoadResult with loaded model
+        """
+        logger.info(f"Loading BF16 model from {model_path} for MPS (Apple Silicon)")
+        logger.info("MPS BF16 loading: direct to device, no block swap needed (512GB unified memory)")
+
+        device_manager = get_device_manager()
+
+        # Log system RAM status
+        try:
+            import psutil
+            ram = psutil.virtual_memory()
+            logger.info(f"System RAM: {ram.available/1024**3:.1f}GB available / "
+                       f"{ram.total/1024**3:.1f}GB total ({ram.percent:.1f}% used)")
+        except ImportError:
+            logger.warning("psutil not available - cannot check system RAM")
+
+        # MPS doesn't support bfloat16, use float16 (half precision)
+        # float16 uses half the memory of float32, keeping usage ~160GB
+        mps_dtype = torch.float16
+        logger.info("Using float16 dtype (MPS doesn't support bfloat16)")
+
+        # Load model directly to MPS without device_map
+        # The 512GB unified memory is sufficient for the entire ~160GB model
+        logger.info("Loading model directly to MPS device...")
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map={"": device},  # Direct placement on MPS
+                trust_remote_code=True,
+                torch_dtype=mps_dtype,
+                attn_implementation="sdpa",
+                moe_impl="eager",
+                moe_drop_tokens=True,
+                low_cpu_mem_usage=True,
+            )
+        except TypeError:
+            # Fallback for older transformers versions
+            logger.warning("Falling back to legacy load args due to TypeError")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map={"": device},
+                trust_remote_code=True,
+                torch_dtype=mps_dtype,
+                low_cpu_mem_usage=True,
+            )
+
+        # Load tokenizer
+        if hasattr(model, 'load_tokenizer'):
+            model.load_tokenizer(model_path)
+            logger.info("Tokenizer loaded")
+
+        # Ensure VAE is on MPS in correct dtype
+        if hasattr(model, 'vae'):
+            target_device = torch.device(device)
+            model.vae = model.vae.to(device=target_device, dtype=mps_dtype)
+            logger.info("VAE moved to MPS in float16")
+
+        # Log memory usage
+        try:
+            import psutil
+            process = psutil.Process()
+            ram_used = process.memory_info().rss / 1024**3
+            logger.info(f"Model loaded on MPS. Process RAM usage: {ram_used:.1f}GB")
+        except Exception:
+            pass
+
+        # Remove hf_device_map if present (we manage placement ourselves)
+        if hasattr(model, 'hf_device_map'):
+            delattr(model, 'hf_device_map')
+
+        logger.info("BF16 model loaded on MPS (float16, no block swap)")
+
+        return LoadResult(
+            model=model,
+            quant_type="bf16",
+            is_moveable=True,  # MPS model can be moved
+            device=device,
+            dtype=mps_dtype,  # float16 for MPS
+            load_time_seconds=0.0,
+            uses_device_map=False
+        )
+
     @classmethod
     def _load_bf16(
         cls,
@@ -277,29 +388,40 @@ class CleanModelLoader:
     ) -> LoadResult:
         """
         Load BF16 model using device_map="auto" with GPU+CPU RAM split.
-        
+
+        For MPS devices (Apple Silicon), routes to _load_bf16_mps which loads
+        directly to MPS without device_map (512GB unified memory is sufficient).
+
+        For CUDA devices, uses device_map="auto" to split across GPU and CPU RAM.
+
         This matches the working HunyuanImage3FullLoader implementation exactly.
-        
+
         BF16 Hunyuan models are ~160GB and won't fit on a single GPU.
         We use device_map="auto" to automatically split across GPU and CPU RAM.
-        
+
         CRITICAL for MoE models:
         - Reserve enough VRAM for inference (MoE routing needs activation memory)
         - Use moe_impl="eager" and moe_drop_tokens=True
         - Use torch_dtype="auto" not explicit bfloat16
         - Use integer device indices (0) not strings ("cuda:0")
-        
+
         IMPORTANT: Models loaded with device_map cannot be easily moved,
         so is_moveable=False and block swapping is NOT supported.
         """
+        # Check for MPS device (Apple Silicon)
+        device_manager = get_device_manager()
+        if device_manager.device_type.value == "mps":
+            logger.info("MPS device detected - using MPS-specific loading path")
+            return cls._load_bf16_mps(model_path, device)
+
         logger.info(f"Loading BF16 model from {model_path}")
         logger.info("BF16 model (~160GB) will be split across GPU and CPU RAM using device_map='auto'")
         logger.warning("BF16 models with device_map CANNOT use block swapping or soft_unload")
         
-        # Clear CUDA cache before loading
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
+        # Clear device cache before loading
+        device_manager = get_device_manager()
+        device_manager.empty_cache()
+        gc.collect()
         
         # Parse device index - this is the PRIMARY GPU for inference
         device_idx = int(device.split(":")[-1]) if ":" in device else 0
@@ -531,10 +653,10 @@ class CleanModelLoader:
         logger.info("BF16 model (~160GB) → CPU first, then non-block parts to GPU")
         logger.info("Transformer blocks will be managed by BlockSwapManager")
 
-        # Clear CUDA cache before loading
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
+        # Clear device cache before loading
+        device_manager = get_device_manager()
+        device_manager.empty_cache()
+        gc.collect()
 
         # Log system RAM availability
         try:
@@ -629,10 +751,10 @@ class CleanModelLoader:
         """
         logger.info(f"Loading NF4 model from {model_path}")
         
-        # Clear CUDA cache before loading
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
+        # Clear device cache before loading
+        device_manager = get_device_manager()
+        device_manager.empty_cache()
+        gc.collect()
         
         quant_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -702,10 +824,10 @@ class CleanModelLoader:
         logger.info("INT8 model → CPU first, then non-block parts to GPU")
         logger.info("Transformer blocks will be managed by BlockSwapManager")
 
-        # Clear CUDA cache before loading
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
+        # Clear device cache before loading
+        device_manager = get_device_manager()
+        device_manager.empty_cache()
+        gc.collect()
 
         # Log system RAM availability
         try:
@@ -812,10 +934,10 @@ class CleanModelLoader:
         logger.info(f"Loading INT8 model from {model_path}")
         logger.info("INT8 direct-to-GPU mode (no block swap)")
         
-        # Clear CUDA cache before loading
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
+        # Clear device cache before loading
+        device_manager = get_device_manager()
+        device_manager.empty_cache()
+        gc.collect()
         
         quant_config = BitsAndBytesConfig(
             load_in_8bit=True,

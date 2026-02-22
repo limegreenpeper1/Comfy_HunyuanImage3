@@ -16,6 +16,8 @@ import json
 
 import torch
 
+from .hunyuan_device import get_device_manager, is_mps_available, is_cuda_available
+
 logger = logging.getLogger(__name__)
 
 
@@ -129,49 +131,80 @@ class MemoryBudget:
     def __init__(self, device: str = "cuda:0"):
         """
         Initialize memory budget calculator.
-        
+
         Args:
-            device: CUDA device string (e.g., "cuda:0")
+            device: Device string (e.g., "cuda:0", "mps", "cpu")
         """
         self.device = device
         self.device_index = int(device.split(":")[-1]) if ":" in device else 0
+        self.device_manager = get_device_manager()
         
     def get_vram_report(self) -> VRAMReport:
-        """Get current VRAM status."""
-        if not torch.cuda.is_available():
-            return VRAMReport(
-                total_bytes=0,
-                free_bytes=0,
-                allocated_bytes=0,
-                reserved_bytes=0,
-                device_name="No CUDA",
-                device_index=0
-            )
-        
-        try:
-            free, total = torch.cuda.mem_get_info(self.device_index)
-            allocated = torch.cuda.memory_allocated(self.device_index)
-            reserved = torch.cuda.memory_reserved(self.device_index)
-            name = torch.cuda.get_device_name(self.device_index)
-            
-            return VRAMReport(
-                total_bytes=total,
-                free_bytes=free,
-                allocated_bytes=allocated,
-                reserved_bytes=reserved,
-                device_name=name,
-                device_index=self.device_index
-            )
-        except Exception as e:
-            logger.error(f"Failed to get VRAM info: {e}")
-            return VRAMReport(
-                total_bytes=0,
-                free_bytes=0,
-                allocated_bytes=0,
-                reserved_bytes=0,
-                device_name="Error",
-                device_index=self.device_index
-            )
+        """Get current VRAM/status report."""
+        device_type = self.device_manager.device_type.value
+
+        # For MPS, we use different memory queries
+        if device_type == "mps":
+            try:
+                free, total = self.device_manager.get_memory_info(self.device_index)
+                allocated = self.device_manager.get_allocated_memory(self.device_index)
+                name = self.device_manager.get_device_name(self.device_index)
+
+                return VRAMReport(
+                    total_bytes=total,
+                    free_bytes=free,
+                    allocated_bytes=allocated,
+                    reserved_bytes=0,  # MPS doesn't have reserved memory
+                    device_name=name,
+                    device_index=self.device_index
+                )
+            except Exception as e:
+                logger.error(f"Failed to get MPS memory info: {e}")
+                return VRAMReport(
+                    total_bytes=0,
+                    free_bytes=0,
+                    allocated_bytes=0,
+                    reserved_bytes=0,
+                    device_name="Error",
+                    device_index=self.device_index
+                )
+
+        # For CUDA (original logic)
+        if device_type == "cuda" and is_cuda_available():
+            try:
+                free, total = torch.cuda.mem_get_info(self.device_index)
+                allocated = torch.cuda.memory_allocated(self.device_index)
+                reserved = torch.cuda.memory_reserved(self.device_index)
+                name = torch.cuda.get_device_name(self.device_index)
+
+                return VRAMReport(
+                    total_bytes=total,
+                    free_bytes=free,
+                    allocated_bytes=allocated,
+                    reserved_bytes=reserved,
+                    device_name=name,
+                    device_index=self.device_index
+                )
+            except Exception as e:
+                logger.error(f"Failed to get VRAM info: {e}")
+                return VRAMReport(
+                    total_bytes=0,
+                    free_bytes=0,
+                    allocated_bytes=0,
+                    reserved_bytes=0,
+                    device_name="Error",
+                    device_index=self.device_index
+                )
+
+        # For CPU or unavailable devices
+        return VRAMReport(
+            total_bytes=0,
+            free_bytes=0,
+            allocated_bytes=0,
+            reserved_bytes=0,
+            device_name=f"No {device_type.upper()}",
+            device_index=0
+        )
     
     def get_total_vram_gb(self) -> float:
         """Get total VRAM in GB."""

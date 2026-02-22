@@ -15,6 +15,11 @@ from typing import Any, Optional
 
 import torch
 
+try:
+    from .hunyuan_device import get_device_manager
+except ImportError:
+    from hunyuan_device import get_device_manager
+
 logger = logging.getLogger(__name__)
 
 
@@ -175,8 +180,8 @@ class SimpleVAEManager:
                     buffer.data = buffer.data.to(device=self.device)
         
         # Sync to ensure transfer is complete
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
+        if self.device.type in ("cuda", "mps"):
+            get_device_manager().synchronize(self.device)
         
         self._vae_on_gpu = True
     

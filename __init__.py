@@ -11,16 +11,20 @@ Dual License:
 1. Non-Commercial Use: This software is licensed under the terms of the
    Creative Commons Attribution-NonCommercial 4.0 International License.
    To view a copy of this license, visit http://creativecommons.org/licenses/by-nc/4.0/
-   
+
 2. Commercial Use: For commercial use, a separate license is required.
    Please contact Eric Hiss at [eric@historic.camera, eric@rollei.us] for licensing options.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
-INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A 
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
 PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
 Note: HunyuanImage-3.0 model is subject to Tencent's Apache 2.0 license.
 """
+
+# Initialize device abstraction layer first (must be before other imports)
+from .hunyuan_device import get_device_manager
+_device_manager = get_device_manager()  # Initialize singleton
 
 # Core working nodes - always loaded
 from .hunyuan_quantized_nodes import NODE_CLASS_MAPPINGS as QUANTIZED_MAPPINGS

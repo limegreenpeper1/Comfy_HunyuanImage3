@@ -19,6 +19,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from PIL import Image
 
+try:
+    from .hunyuan_device import get_device_manager, is_mps_available
+except ImportError:
+    from hunyuan_device import get_device_manager, is_mps_available
+
 # ComfyUI imports
 try:
     import comfy.model_management as mm
@@ -1003,18 +1008,27 @@ class HunyuanUnifiedV2:
     ) -> Tuple[torch.Tensor]:
         """
         Generate images using HunyuanImage-3.0.
-        
+
         This is the main entry point called by ComfyUI.
         """
         start_time = time.time()
-        device = "cuda:0"
-        
-        # Check baseline VRAM at start - detect if other extensions grabbed memory
-        if torch.cuda.is_available():
+        device_manager = get_device_manager()
+        device = device_manager.get_device_string()
+
+        # Check baseline memory at start - detect if other extensions grabbed memory
+        if device_manager.device_type.value == "cuda":
             baseline_free_bytes, total_bytes = torch.cuda.mem_get_info(0)
             baseline_free_gb = baseline_free_bytes / 1024**3
             baseline_allocated_gb = torch.cuda.memory_allocated(0) / 1024**3
             logger.info(f"Baseline VRAM at generate() start: {baseline_allocated_gb:.1f}GB allocated, {baseline_free_gb:.1f}GB free")
+        elif device_manager.device_type.value == "mps":
+            # MPS doesn't provide fine-grained memory tracking
+            try:
+                import psutil
+                ram = psutil.virtual_memory()
+                logger.info(f"Baseline System RAM at generate() start: {ram.available/1024**3:.1f}GB available / {ram.total/1024**3:.1f}GB total")
+            except ImportError:
+                logger.info("Baseline: MPS device (memory tracking not available)")
         
         # Handle seed
         if seed == -1:

@@ -19,6 +19,11 @@ from pathlib import Path
 
 import torch
 
+try:
+    from .hunyuan_device import get_device_manager
+except ImportError:
+    from hunyuan_device import get_device_manager
+
 logger = logging.getLogger(__name__)
 
 
@@ -292,9 +297,9 @@ class ModelCacheV2:
             # Move VAE to CPU
             if cached.vae_manager:
                 cached.vae_manager.cleanup_after_decode()
-            
+
             cached.is_on_gpu = False
-            torch.cuda.empty_cache()
+            get_device_manager().empty_cache()
             
             logger.info(f"Soft unloaded model: {key}")
             return True
@@ -731,13 +736,23 @@ class ModelCacheV2:
                     
                 except Exception as e:
                     logger.warning(f"    Tensor cleanup error: {e}")
-                
-                # Flush CUDA caching allocator to return freed GPU memory to CUDA
-                torch.cuda.empty_cache()
-                
-                vram_after = torch.cuda.memory_allocated() / 1024**3
-                vram_free = (torch.cuda.get_device_properties(0).total_memory 
-                            - torch.cuda.memory_reserved()) / 1024**3
+
+                # Flush device caching allocator to return freed GPU memory
+                device_manager = get_device_manager()
+                device_manager.empty_cache()
+
+                # Log memory after cleanup (CUDA only)
+                if device_manager.device_type.value == "cuda":
+                    try:
+                        vram_after = torch.cuda.memory_allocated() / 1024**3
+                        vram_free = (torch.cuda.get_device_properties(0).total_memory
+                                    - torch.cuda.memory_reserved()) / 1024**3
+                        logger.info(f"    After tensor cleanup: {vram_after:.1f}GB VRAM allocated, "
+                                   f"~{vram_free:.1f}GB free")
+                    except Exception:
+                        pass
+                else:
+                    logger.info(f"    After tensor cleanup: (memory tracking not available on this device)")
                 logger.info(f"    After tensor cleanup: {vram_after:.1f}GB VRAM allocated, "
                            f"~{vram_free:.1f}GB free")
             else:
@@ -761,7 +776,7 @@ class ModelCacheV2:
         import gc
         gc.collect()
         gc.collect()  # second pass catches garbage created by __del__ finalizers
-        torch.cuda.empty_cache()
+        get_device_manager().empty_cache()
         
         # Step 8b removed — the scoped nuclear scan in Step 5b.5 already
         # broke all closure cells referencing Hunyuan modules.  Any nn.Module
@@ -769,8 +784,9 @@ class ModelCacheV2:
         
         # Step 9: Clear PyTorch internal allocator caches
         logger.info("  Step 9: Clearing allocator caches...")
-        torch.cuda.empty_cache()
-        # Clear CUDA host (pinned memory) allocator cache
+        device_manager = get_device_manager()
+        device_manager.empty_cache()
+        # Clear CUDA host (pinned memory) allocator cache (CUDA only)
         try:
             torch._C._host_emptyCache()
             logger.info("    Cleared CUDA host allocator cache")

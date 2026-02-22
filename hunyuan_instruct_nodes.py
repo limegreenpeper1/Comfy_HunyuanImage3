@@ -85,6 +85,18 @@ except ImportError:
         BlockSwapConfig = None
         BlockSwapManager = None
 
+# Import device manager for MPS support
+try:
+    from .hunyuan_device import get_device_manager
+    DEVICE_MANAGER_AVAILABLE = True
+except ImportError:
+    try:
+        from hunyuan_device import get_device_manager
+        DEVICE_MANAGER_AVAILABLE = True
+    except ImportError:
+        DEVICE_MANAGER_AVAILABLE = False
+        get_device_manager = None
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -178,34 +190,51 @@ RESOLUTION_LIST = list(INSTRUCT_RESOLUTION_PRESETS.keys())
 
 def get_gpu_info() -> List[Dict[str, Any]]:
     """
-    Get information about available GPUs sorted by VRAM (largest first).
-    
+    Get information about available GPUs/accelerators sorted by memory (largest first).
+
     Returns:
         List of dicts with keys: index, name, total_vram_gb, free_vram_gb
     """
-    if not torch.cuda.is_available():
-        return []
-    
-    gpus = []
-    for i in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(i)
-        total_vram = props.total_memory
-        # Use mem_get_info for accurate free memory (accounts for fragmentation)
-        try:
-            free_vram, _ = torch.cuda.mem_get_info(i)
-        except Exception:
-            free_vram = total_vram - torch.cuda.memory_allocated(i)
-        
-        gpus.append({
-            "index": i,
-            "name": props.name,
-            "total_vram_gb": total_vram / (1024**3),
-            "free_vram_gb": free_vram / (1024**3),
-        })
-    
-    # Sort by TOTAL VRAM descending (largest GPU first for layer priority)
-    gpus.sort(key=lambda x: x["total_vram_gb"], reverse=True)
-    return gpus
+    result = []
+
+    # Check MPS (Apple Silicon) first
+    if DEVICE_MANAGER_AVAILABLE:
+        device_manager = get_device_manager()
+        if device_manager.device_type.value == "mps":
+            try:
+                import psutil
+                ram = psutil.virtual_memory()
+                result.append({
+                    "index": 0,
+                    "name": "Apple Silicon (MPS)",
+                    "total_vram_gb": ram.total / (1024**3),
+                    "free_vram_gb": ram.available / (1024**3),
+                })
+                return result
+            except Exception:
+                pass
+
+    # Check CUDA
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            total_vram = props.total_memory
+            # Use mem_get_info for accurate free memory (accounts for fragmentation)
+            try:
+                free_vram, _ = torch.cuda.mem_get_info(i)
+            except Exception:
+                free_vram = total_vram - torch.cuda.memory_allocated(i)
+
+            result.append({
+                "index": i,
+                "name": props.name,
+                "total_vram_gb": total_vram / (1024**3),
+                "free_vram_gb": free_vram / (1024**3),
+            })
+
+    # Sort by TOTAL memory descending (largest GPU first for layer priority)
+    result.sort(key=lambda x: x["total_vram_gb"], reverse=True)
+    return result
 
 
 def create_device_map_for_instruct(
@@ -214,19 +243,21 @@ def create_device_map_for_instruct(
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     Create optimal device_map + max_memory for Instruct model on multi-GPU.
-    
+
+    For MPS (Apple Silicon), returns a simple device_map for direct loading.
+
     CRITICAL INSIGHT: The MoE dispatch_mask is allocated on whichever device
     a transformer layer executes on. If ANY transformer layer runs on a
     secondary GPU (e.g. 48GB RTX 5000), the dispatch_mask (~6-12GB for
     multi-fusion, ~28GB for think_recaption+CFG) can OOM that GPU.
-    
+
     Therefore, ALL transformer layers must execute on the primary GPU (GPU 0).
     Layers that don't fit on GPU 0 go to CPU — accelerate's CPU-offloaded
     layers execute on main_device (GPU 0), so dispatch_mask is still on GPU 0.
-    
+
     Secondary GPUs only get lightweight pre/post-processing components:
     VAE, vision_model, vision_aligner. These don't create dispatch_masks.
-    
+
     Model structure (HunyuanImage3ForCausalMM):
       COMPUTE (must be on GPU 0 or CPU-offloaded to GPU 0):
         model.layers.0..31    - 32 transformer blocks (dispatch_mask here!)
@@ -240,35 +271,43 @@ def create_device_map_for_instruct(
         time_embed            - time embedding (used every diffusion step)
         time_embed_2          - time embedding 2 (used in final_layer)
         final_layer           - output projection (used every diffusion step)
-      
+
       PRE/POST-PROCESSING (safe to put on secondary GPU):
         vae                   - VAE encoder/decoder (~600MB bf16)
         vision_model          - Siglip2 vision transformer (~800MB bf16)
         vision_aligner        - Light projector (tiny)
-    
+
     Args:
         reserve_min_gb: Minimum GB to reserve on primary GPU for inference.
             Default 30GB covers dispatch_mask (~14GB) + KV cache + activations.
         model_size_gb: Estimated total model size in GB (for budget calculation).
-        
+
     Returns:
         Tuple of (device_map, max_memory) for from_pretrained().
         device_map is an explicit dict mapping module names to devices,
         OR "auto" with max_memory if we can't build an explicit map.
     """
+    # Check for MPS (Apple Silicon) first
+    if DEVICE_MANAGER_AVAILABLE:
+        device_manager = get_device_manager()
+        if device_manager.device_type.value == "mps":
+            logger.info("MPS detected - using direct device placement (no device_map)")
+            # For MPS, return simple device_map that loads everything to MPS
+            return {"": "mps"}, {}
+
     gpus = get_gpu_info()
-    
+
     if not gpus:
         logger.warning("No CUDA GPUs found, model will load on CPU only")
         return "auto", {"cpu": "200GiB"}
-    
+
     # Log detected GPUs
     logger.info("=" * 60)
     logger.info("GPU Detection for Instruct Model:")
     for gpu in gpus:
         logger.info(f"  GPU {gpu['index']}: {gpu['name']}")
         logger.info(f"    Total: {gpu['total_vram_gb']:.1f}GB, Free: {gpu['free_vram_gb']:.1f}GB")
-    
+
     primary_gpu = gpus[0]  # Sorted by total VRAM descending
     primary_idx = primary_gpu["index"]
     primary_free = primary_gpu["free_vram_gb"]
@@ -1530,35 +1569,44 @@ class HunyuanInstructLoader:
             logger.info("Force reload: cleaning up previous model...")
             import psutil
             ram_before = psutil.Process().memory_info().rss / 1024**3
-            
+
             # Step 1: Our cache clear — breaks circular refs (9-step cleanup)
             _instruct_cache.clear()
-            
+
             # Step 2: Multiple gc rounds to collect broken cycles
             gc.collect()
             gc.collect()
             gc.collect()
-            
-            if torch.cuda.is_available():
+
+            # Use device manager for cache clearing (works for CUDA and MPS)
+            if DEVICE_MANAGER_AVAILABLE:
+                device_manager = get_device_manager()
+                device_manager.empty_cache()
+                device_manager.synchronize()
+            elif torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-            
+
             # Step 3: Final gc (orphan hunt removed — it was destroying
             # other models' parameters across the process)
             gc.collect()
             gc.collect()
-            
-            if torch.cuda.is_available():
+
+            if DEVICE_MANAGER_AVAILABLE:
+                device_manager = get_device_manager()
+                device_manager.empty_cache()
+                device_manager.synchronize()
+            elif torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-            
+
             # Force Windows to return freed memory to OS
             try:
                 from .hunyuan_shared import force_windows_memory_release
             except ImportError:
                 from hunyuan_shared import force_windows_memory_release
             force_windows_memory_release()
-            
+
             ram_after = psutil.Process().memory_info().rss / 1024**3
             logger.info(f"  Force reload cleanup: RAM {ram_before:.1f}GB → {ram_after:.1f}GB "
                        f"(freed {ram_before - ram_after:.1f}GB)")
@@ -1612,12 +1660,28 @@ class HunyuanInstructLoader:
                              f"For INT8 CFG inference, recommend blocks_to_swap >= 10-15 "
                              f"to leave enough VRAM for the doubled dispatch_mask.")
         
+        # Detect device (MPS or CUDA)
+        target_device_str = "cuda:0"  # Default
+        if DEVICE_MANAGER_AVAILABLE:
+            device_manager = get_device_manager()
+            target_device_str = device_manager.get_device_string()
+            is_mps = device_manager.device_type.value == "mps"
+        else:
+            is_mps = False
+
         # Clear VRAM before loading
         gc.collect()
-        if torch.cuda.is_available():
+        if DEVICE_MANAGER_AVAILABLE:
+            device_manager = get_device_manager()
+            device_manager.empty_cache()
+            device_manager.synchronize()
+        elif torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-        
+
+        # Log target device
+        logger.info(f"Target device: {target_device_str}")
+
         # Load model with type-specific strategy
         start_time = time.time()
         
@@ -1661,7 +1725,7 @@ class HunyuanInstructLoader:
                 )
                 # Move non-block components to GPU (VAE, vision, embeddings, etc.)
                 logger.info("  Moving non-block components to GPU...")
-                _move_non_block_components_to_gpu(model, target_device="cuda:0", verbose=1)
+                _move_non_block_components_to_gpu(model, target_device=target_device_str, verbose=1)
                 model_info["is_moveable"] = True
             else:
                 # No block swap: load INT8 model to GPU(s).
@@ -1778,9 +1842,49 @@ class HunyuanInstructLoader:
                 model_info["is_moveable"] = False
             
         else:
-            # BF16 model: ~160GB. Strategy depends on blocks_to_swap.
-            
-            if blocks_to_swap > 0 and BLOCK_SWAP_AVAILABLE:
+            # BF16 model: ~160GB. Strategy depends on blocks_to_swap and device.
+
+            # MPS-specific path: Load directly to MPS (512GB unified memory is sufficient)
+            if is_mps:
+                logger.info("Loading BF16 Instruct model directly to MPS (Apple Silicon)...")
+                logger.info("  MPS has 512GB unified memory - no block swap needed")
+
+                # Determine dtype (MPS doesn't support bfloat16, use float16)
+                # float16 uses half the memory of float32, keeping usage ~160GB
+                mps_dtype = torch.float16
+                logger.info("  Using float16 dtype (MPS doesn't support bfloat16)")
+
+                # CRITICAL: Monkey-patch torch.empty to fix hardcoded "cuda" in model code
+                # The Hunyuan VAE has `torch.empty(0, device="cuda")` which fails on MPS
+                original_torch_empty = torch.empty
+                def _patched_empty(*args, **kwargs):
+                    # If device is "cuda", replace with target device
+                    if 'device' in kwargs and kwargs['device'] == "cuda":
+                        kwargs['device'] = target_device_str
+                    elif len(args) > 1 and hasattr(args[1], 'type') and args[1].type == 'str':
+                        # Positional device argument
+                        args = list(args)
+                        if args[1] == "cuda":
+                            args[1] = target_device_str
+                    return original_torch_empty(*args, **kwargs)
+
+                torch.empty = _patched_empty
+                try:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_path,
+                        attn_implementation=attention_impl,
+                        trust_remote_code=True,
+                        torch_dtype=mps_dtype,
+                        device_map={"": target_device_str},  # Direct MPS placement
+                        low_cpu_mem_usage=True,
+                        moe_impl=moe_impl,
+                        moe_drop_tokens=True,
+                    )
+                finally:
+                    torch.empty = original_torch_empty
+                model_info["is_moveable"] = True
+
+            elif blocks_to_swap > 0 and BLOCK_SWAP_AVAILABLE:
                 # Block swap mode: load entirely to CPU, then manually place
                 # non-block components on GPU. BlockSwapManager handles the
                 # 32 transformer blocks (~5GB each). This avoids accelerate's
@@ -1801,7 +1905,7 @@ class HunyuanInstructLoader:
                 )
                 # Move non-block components to GPU (VAE, vision, embeddings, etc.)
                 logger.info("  Moving non-block components to GPU...")
-                _move_non_block_components_to_gpu(model, target_device="cuda:0", verbose=1)
+                _move_non_block_components_to_gpu(model, target_device=target_device_str, verbose=1)
                 model_info["is_moveable"] = True
             else:
                 # No block swap: use explicit device map to distribute across GPUs.
@@ -1830,11 +1934,76 @@ class HunyuanInstructLoader:
         if hasattr(model, 'hf_device_map'):
             devices_used = set(str(v) for v in model.hf_device_map.values())
             logger.info(f"Model distributed across: {', '.join(sorted(devices_used))}")
-        
+
+        # CRITICAL: Set model_version for tokenizer loading
+        # The Instruct-Distil model config doesn't include model_version, but
+        # load_tokenizer() requires it. We set it based on detected model_type.
+        if hasattr(model, 'config') and not hasattr(model.config, 'model_version'):
+            model_type = model_info.get('model_type', 'base')
+            model.config.model_version = 'distil' if model_type == 'distil' else 'base'
+            logger.info(f"  Set config.model_version = {model.config.model_version}")
+
         # Load tokenizer
         logger.info("Loading tokenizer...")
         model.load_tokenizer(model_path)
-        
+
+        # CRITICAL: For MPS with float16, ensure ALL model components are float16
+        # The model may have mixed bfloat16/float16 dtypes after loading, which causes
+        # runtime errors: "Input type (BFloat16) and bias type (Half) should be the same"
+        if is_mps:
+            logger.info("Harmonizing model dtype to float16 for MPS...")
+            target_device = torch.device(target_device_str)
+
+            # Comprehensive conversion: recursively convert ALL parameters and buffers to float16
+            def convert_module_to_float16(module, name=""):
+                """Recursively convert a module and all its children to float16."""
+                if module is None:
+                    return
+
+                # Convert this module's parameters and buffers
+                for param_name, param in list(module.named_parameters(recurse=False)):
+                    if param.dtype != torch.float16:
+                        param.data = param.data.to(dtype=torch.float16)
+                        logger.debug(f"    Converted {name}.{param_name} to float16")
+
+                for buffer_name, buffer in list(module.named_buffers(recurse=False)):
+                    if buffer.dtype != torch.float16:
+                        buffer.data = buffer.data.to(dtype=torch.float16)
+                        logger.debug(f"    Converted buffer {name}.{buffer_name} to float16")
+
+                # Recursively convert child modules
+                for child_name, child in list(module.named_children()):
+                    convert_module_to_float16(child, f"{name}.{child_name}" if name else child_name)
+
+            # Convert VAE (critical - contains patch_embed that causes the dtype mismatch)
+            if hasattr(model, 'vae') and model.vae is not None:
+                logger.info("  Converting VAE to float16...")
+                model.vae = model.vae.to(device=target_device)
+                convert_module_to_float16(model.vae, "vae")
+
+            # Convert vision model
+            if hasattr(model, 'vision_model') and model.vision_model is not None:
+                logger.info("  Converting vision_model to float16...")
+                model.vision_model = model.vision_model.to(device=target_device)
+                convert_module_to_float16(model.vision_model, "vision_model")
+
+            # Convert the main model
+            logger.info("  Converting model parameters to float16...")
+            model = model.to(device=target_device)
+            convert_module_to_float16(model, "model")
+
+            # CRITICAL: Set model config dtype to float16
+            # This ensures internal tensor creation uses float16 instead of bfloat16
+            if hasattr(model, 'config'):
+                model.config.torch_dtype = torch.float16
+                logger.debug("  Set model.config.torch_dtype = float16")
+
+            if hasattr(model, 'vae') and hasattr(model.vae, 'config'):
+                model.vae.config.torch_dtype = torch.float16
+                logger.debug("  Set vae.config.torch_dtype = float16")
+
+            logger.info("  ✓ Model dtype harmonized to float16")
+
         # Apply critical patches for memory management and dtype compatibility
         if SHARED_UTILS_AVAILABLE:
             logger.info("Applying dtype compatibility patches...")
@@ -1858,6 +2027,127 @@ class HunyuanInstructLoader:
             # Fix HunyuanStaticCache device mismatch on multi-GPU setups
             if patch_hunyuan_static_cache_device:
                 patch_hunyuan_static_cache_device(model)
+
+        # CRITICAL: For MPS, patch model methods to handle dtype conversion
+        # The model may create BFloat16 tensors internally, which conflicts with
+        # float16 parameters. We patch instantiate_vae_image_tokens to convert
+        # inputs to float16 before they're passed to float16 layers.
+        if is_mps:
+            logger.info("Applying MPS dtype conversion patches...")
+
+            # Patch instantiate_vae_image_tokens to convert images/t_emb to float16
+            if hasattr(model, 'instantiate_vae_image_tokens'):
+                original_instantiate = model.instantiate_vae_image_tokens
+
+                def _patched_instantiate_vae_image_tokens(self, *args, **kwargs):
+                    # Convert any BFloat16 or float32 tensor arguments to float16 for MPS compatibility
+                    new_args = []
+                    for arg in args:
+                        if isinstance(arg, torch.Tensor):
+                            if arg.dtype in (torch.bfloat16, torch.float32):
+                                new_args.append(arg.to(dtype=torch.float16))
+                            else:
+                                new_args.append(arg)
+                        else:
+                            new_args.append(arg)
+
+                    # Also convert float32 tensors in kwargs
+                    new_kwargs = {}
+                    for k, v in kwargs.items():
+                        if isinstance(v, torch.Tensor) and v.dtype in (torch.bfloat16, torch.float32):
+                            new_kwargs[k] = v.to(dtype=torch.float16)
+                        else:
+                            new_kwargs[k] = v
+
+                    return original_instantiate(*new_args, **new_kwargs)
+
+                model.instantiate_vae_image_tokens = _patched_instantiate_vae_image_tokens.__get__(model, type(model))
+                logger.info("  ✓ Patched instantiate_vae_image_tokens for dtype conversion")
+
+            # Also patch torch.tensor to default to float16 instead of bfloat16
+            # This affects internal tensor creation in the model
+            original_torch_tensor = torch.tensor
+
+            def _patched_tensor(*args, **kwargs):
+                # If no dtype specified and on MPS, default to float16
+                if 'dtype' not in kwargs and len(args) < 2:
+                    # Check if we're in a model context by looking at the call stack
+                    kwargs['dtype'] = torch.float16
+                return original_torch_tensor(*args, **kwargs)
+
+            # Store the patch for later restoration
+            if not hasattr(model, '_original_torch_tensor'):
+                model._original_torch_tensor = original_torch_tensor
+                model._patched_tensor_active = True
+
+            # CRITICAL: Patch torch.cuda.set_device for MPS compatibility
+            # The model code has hardcoded torch.cuda.set_device(device.index) calls
+            # which fail on MPS (no device.index, and no CUDA available)
+            # For MPS, we make this a complete no-op since CUDA is not available
+            original_cuda_set_device = torch.cuda.set_device
+
+            def _patched_set_device(device):
+                # Complete no-op for MPS - CUDA is not available
+                # The model calls torch.cuda.set_device(hidden_states.device.index)
+                # but MPS doesn't use CUDA device switching
+                return
+
+            torch.cuda.set_device = _patched_set_device
+            model._original_cuda_set_device = original_cuda_set_device
+            logger.info("  ✓ Patched torch.cuda.set_device for MPS (no-op)")
+
+            # CRITICAL: Patch torch.cuda.nvtx for MPS compatibility
+            # The model uses nvtx.range() for profiling, which is CUDA-only
+            try:
+                import torch.cuda.nvtx as nvtx
+
+                # Create a dummy context manager for nvtx.range()
+                from contextlib import contextmanager
+
+                @contextmanager
+                def _nvtx_range_dummy(msg, *args, **kwargs):
+                    # No-op context manager for MPS
+                    yield
+
+                original_nvtx_range = nvtx.range
+                nvtx.range = _nvtx_range_dummy
+
+                # Also patch torch.cuda.nvtx if accessed directly
+                if hasattr(torch.cuda, 'nvtx'):
+                    torch.cuda.nvtx.range = _nvtx_range_dummy
+
+                logger.info("  ✓ Patched torch.cuda.nvtx.range for MPS (no-op)")
+            except (ImportError, AttributeError) as e:
+                logger.debug(f"  nvtx not available or already patched: {e}")
+
+            # CRITICAL: Patch VAE decode for MPS dtype compatibility
+            # The VAE decode may receive float32 inputs which conflict with float16 parameters
+            if hasattr(model, 'vae') and hasattr(model.vae, 'decode'):
+                original_vae_decode = model.vae.decode
+
+                def _patched_vae_decode(self, *args, **kwargs):
+                    # Convert float32 inputs to float16 for MPS compatibility
+                    new_args = []
+                    for arg in args:
+                        if isinstance(arg, torch.Tensor) and arg.dtype == torch.float32:
+                            new_args.append(arg.to(dtype=torch.float16))
+                        else:
+                            new_args.append(arg)
+
+                    # Also convert float32 tensors in kwargs
+                    new_kwargs = {}
+                    for k, v in kwargs.items():
+                        if isinstance(v, torch.Tensor) and v.dtype == torch.float32:
+                            new_kwargs[k] = v.to(dtype=torch.float16)
+                        else:
+                            new_kwargs[k] = v
+
+                    return original_vae_decode(*new_args, **new_kwargs)
+
+                model.vae.decode = _patched_vae_decode.__get__(model.vae, type(model.vae))
+                logger.info("  ✓ Patched VAE decode for float32->float16 conversion")
+
+            logger.info("  ✓ MPS dtype patches applied")
         
         # Setup block swap for models with blocks_to_swap > 0
         # Works for NF4 (proven), INT8 (Int8Params.to() supports device movement),
@@ -1871,7 +2161,7 @@ class HunyuanInstructLoader:
                 prefetch_blocks=2,
                 use_non_blocking=True,
             )
-            block_swap_manager = BlockSwapManager(model, swap_config, target_device="cuda:0")
+            block_swap_manager = BlockSwapManager(model, swap_config, target_device=target_device_str)
             block_swap_manager.setup_initial_placement()
             block_swap_manager.install_hooks()
             

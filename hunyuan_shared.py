@@ -865,7 +865,11 @@ def _ensure_bias_device(module, target_device: torch.device) -> None:
 
 def ensure_model_on_device(model, device: torch.device, skip_quantized_params: bool) -> None:
     """Move buffers/params plus attach hooks so future biases stay on the right device."""
-    if not torch.cuda.is_available():
+    # Check if we have a supported device (CUDA or MPS)
+    is_cuda = torch.cuda.is_available()
+    is_mps = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+
+    if not is_cuda and not is_mps:
         return
 
     patch_scaled_dot_product_attention()

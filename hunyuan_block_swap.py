@@ -24,6 +24,11 @@ from contextlib import contextmanager
 import torch
 import torch.nn as nn
 
+try:
+    from .hunyuan_device import get_device_manager
+except ImportError:
+    from hunyuan_device import get_device_manager
+
 logger = logging.getLogger(__name__)
 
 
@@ -690,7 +695,20 @@ class BlockSwapManager:
         if not self.blocks:
             logger.warning("No blocks to set up")
             return
-        
+
+        # Disable block swap for MPS (Apple Silicon)
+        # MPS has unified memory (512GB on M3 Ultra), no need for block swap
+        device_manager = get_device_manager()
+        if device_manager.device_type.value == "mps":
+            logger.info("Block swap disabled for MPS (Apple Silicon)")
+            logger.info("MPS has unified memory - entire model fits in 512GB")
+            # Place all blocks on MPS
+            for i, block in enumerate(self.blocks):
+                self.block_locations[i] = self.target_device
+            self.stats.blocks_currently_on_gpu = self.num_blocks
+            self.stats.blocks_currently_on_cpu = 0
+            return
+
         blocks_to_swap = min(self.config.blocks_to_swap, self.num_blocks)
         
         # First, detect actual placement (important for device_map models)
@@ -803,8 +821,8 @@ class BlockSwapManager:
         block.to(device, non_blocking=non_blocking)
         self._fix_int8_state_devices(block, device)
         
-        if not non_blocking and device.type == "cuda":
-            torch.cuda.synchronize(device)
+        if not non_blocking and device.type in ("cuda", "mps"):
+            get_device_manager().synchronize(device)
         
         elapsed = time.time() - start_time
         self.block_locations[block_idx] = device
@@ -905,8 +923,8 @@ class BlockSwapManager:
                 self._fix_int8_state_devices(block, device)
         
         # Sync if blocking transfer to GPU
-        if not non_blocking and device.type == "cuda":
-            torch.cuda.synchronize(device)
+        if not non_blocking and device.type in ("cuda", "mps"):
+            get_device_manager().synchronize(device)
         
         elapsed = time.time() - start_time
         
@@ -975,7 +993,7 @@ class BlockSwapManager:
             if first_param.device != self.target_device:
                 logger.warning(f"Block {block_idx} not on {self.target_device}, forcing move!")
                 block.to(self.target_device)
-                torch.cuda.synchronize()
+                get_device_manager().synchronize(self.target_device)
                 self.block_locations[block_idx] = self.target_device
         except StopIteration:
             pass
@@ -1374,8 +1392,8 @@ class BlockSwapManager:
         for i in range(self.num_blocks):
             if self.block_locations.get(i) != self.target_device:
                 total_time += self._move_block_to_device(i, self.target_device)
-        
-        torch.cuda.synchronize()
+
+        get_device_manager().synchronize(self.target_device)
         logger.info(f"All {self.num_blocks} blocks moved to GPU in {total_time:.2f}s")
         return total_time
     

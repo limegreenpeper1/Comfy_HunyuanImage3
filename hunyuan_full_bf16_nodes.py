@@ -40,6 +40,11 @@ from .hunyuan_shared import (
     resolve_hunyuan_model_path,
 )
 
+try:
+    from .hunyuan_device import get_device_manager, is_mps_available
+except ImportError:
+    from hunyuan_device import get_device_manager, is_mps_available
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -67,6 +72,16 @@ class HunyuanImage3FullLoader:
     
     @classmethod
     def INPUT_TYPES(cls):
+        # Build device list dynamically based on available devices
+        device_manager = get_device_manager()
+        device_options = ["Auto (Detect)"]
+
+        if device_manager.is_cuda_available:
+            device_options.append("CUDA:0")
+
+        if device_manager.is_mps_available:
+            device_options.append("MPS")
+
         return {
             "required": {
                 "model_name": (cls._get_available_models(),),
@@ -81,20 +96,24 @@ class HunyuanImage3FullLoader:
                 }),
             },
             "optional": {
+                "device": (device_options, {
+                    "default": "Auto (Detect)",
+                    "tooltip": "Device to use for model loading. Auto detects the best available device (MPS > CUDA > CPU)."
+                }),
                 "unload_signal": ("*", {"default": None}),
             }
         }
-    
+
     RETURN_TYPES = ("HUNYUAN_MODEL",)
     FUNCTION = "load_model"
     CATEGORY = "HunyuanImage3"
 
     @classmethod
-    def IS_CHANGED(cls, model_name, force_reload=False, target_resolution="Auto (safe default)", clear_vram_before_load=False, unload_signal=None, **kwargs):
+    def IS_CHANGED(cls, model_name, force_reload=False, target_resolution="Auto (safe default)", clear_vram_before_load=False, device="Auto (Detect)", unload_signal=None, **kwargs):
         if force_reload:
             return float("nan")
-        # Reload if resolution changes (different memory reservation needed)
-        return f"{model_name}_{target_resolution}"
+        # Reload if resolution or device changes
+        return f"{model_name}_{target_resolution}_{device}"
     
     @classmethod
     def _get_available_models(cls):
@@ -117,21 +136,30 @@ class HunyuanImage3FullLoader:
                     result.append(name)
         return result if result else ["HunyuanImage-3"]
     
-    def load_model(self, model_name, force_reload=False, target_resolution="Auto (safe default)", clear_vram_before_load=False, unload_signal=None):
+    def load_model(self, model_name, force_reload=False, target_resolution="Auto (safe default)", clear_vram_before_load=False, device="Auto (Detect)", unload_signal=None):
         import gc
-        
+
+        # Determine the target device
+        device_manager = get_device_manager()
+        if device == "Auto (Detect)":
+            target_device_str = device_manager.get_device_string()
+        else:
+            target_device_str = device
+
+        logger.info(f"Loading BF16 model on device: {target_device_str}")
+
         # If requested, clear OTHER models from VRAM while PRESERVING our Hunyuan cache
         # This is useful for successive runs where downstream models (Flux, SAM2) pollute VRAM
         if clear_vram_before_load:
             logger.info("=" * 60)
             logger.info("CLEARING OTHER MODELS FROM VRAM (keeping Hunyuan cached)")
             logger.info("=" * 60)
-            
+
             # Use ComfyUI's model management to unload other models
             # This does NOT affect our HunyuanModelCache
             try:
                 import comfy.model_management as mm
-                
+
                 if hasattr(mm, 'unload_all_models'):
                     mm.unload_all_models()
                     logger.info("Cleared ComfyUI managed models")
@@ -139,23 +167,33 @@ class HunyuanImage3FullLoader:
                     mm.soft_empty_cache()
                 if hasattr(mm, 'cleanup_models'):
                     mm.cleanup_models()
-                    
+
             except ImportError:
                 logger.warning("ComfyUI model_management not available")
             except Exception as e:
                 logger.warning(f"Error clearing ComfyUI models: {e}")
-            
+
             # Force garbage collection
             for _ in range(3):
                 gc.collect()
-            
-            # Clear CUDA cache (but NOT our Hunyuan model which is in HunyuanModelCache)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                
-                free, total = torch.cuda.mem_get_info(0)
-                logger.info(f"After clearing other models: {free/1024**3:.1f}GB free of {total/1024**3:.1f}GB")
+
+            # Clear device cache (but NOT our Hunyuan model which is in HunyuanModelCache)
+            device_manager.empty_cache()
+            device_manager.synchronize()
+
+            if device_manager.device_type.value == "cuda":
+                try:
+                    free, total = torch.cuda.mem_get_info(0)
+                    logger.info(f"After clearing other models: {free/1024**3:.1f}GB free of {total/1024**3:.1f}GB")
+                except Exception:
+                    pass
+            elif device_manager.device_type.value == "mps":
+                try:
+                    import psutil
+                    ram = psutil.virtual_memory()
+                    logger.info(f"After clearing: System RAM {ram.available/1024**3:.1f}GB available / {ram.total/1024**3:.1f}GB total")
+                except Exception:
+                    pass
                 
             # Verify our cache is intact
             if HunyuanModelCache._cached_model is not None:
@@ -190,7 +228,10 @@ class HunyuanImage3FullLoader:
             if cached is None:
                 # Debug: show why cache miss occurred
                 HunyuanModelCache.debug_status()
-        
+
+        # Convert device string to torch.device
+        target_device = torch.device(target_device_str)
+
         if cached is not None:
             try:
                 # Check if model is soft-unloaded to CPU (fast restore path)
@@ -199,7 +240,7 @@ class HunyuanImage3FullLoader:
                     if HunyuanModelCache.restore_to_gpu():
                         logger.info("✓ Model restored from CPU to GPU")
                         self._apply_dtype_patches()
-                        ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=False)
+                        ensure_model_on_device(cached, target_device, skip_quantized_params=False)
                         return (cached,)
                     else:
                         # Restore failed, need to reload from disk
@@ -232,7 +273,7 @@ class HunyuanImage3FullLoader:
                     if has_cuda:
                         logger.info("Using cached model from previous load (has CUDA tensors)")
                         self._apply_dtype_patches()
-                        ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=False)
+                        ensure_model_on_device(cached, target_device, skip_quantized_params=False)
                         return (cached,)
                     elif has_cpu_only:
                         logger.warning("Cached model on CPU but not tracked as soft-unloaded, clearing...")
@@ -250,18 +291,25 @@ class HunyuanImage3FullLoader:
                 cached = None
         
         logger.info(f"Loading FULL BF16 model: {model_name}")
-        logger.info("This uses ~80GB VRAM but avoids quantization complexity")
+        logger.info(f"This uses ~160GB on {target_device_str} but avoids quantization complexity")
         logger.info("Loading model (this may take 30-60 seconds)...")
 
         model = None
         try:
             # Calculate max memory to reserve space for activations
             max_memory = None
-            if torch.cuda.is_available():
+
+            # For MPS, we don't need device_map (512GB unified memory is sufficient)
+            if device_manager.device_type.value == "mps":
+                logger.info("MPS detected: Loading directly to device (no memory offloading needed)")
+                max_memory = None  # No device_map for MPS
+
+            # For CUDA, use device_map with memory limits
+            elif torch.cuda.is_available():
                 free, total = torch.cuda.mem_get_info(0)
                 free_gb = free / 1024**3
                 total_gb = total / 1024**3
-                
+
                 # WARN if VRAM isn't mostly free - this will cause slow inference!
                 if free_gb < total_gb * 0.85:
                     logger.warning("=" * 60)
@@ -270,24 +318,24 @@ class HunyuanImage3FullLoader:
                     logger.warning("CPU offloading and SLOWER inference (20+ min vs 8 min).")
                     logger.warning("Consider running Force Unload first or restarting ComfyUI.")
                     logger.warning("=" * 60)
-                
+
                 # Reserve specified amount for generation overhead
                 reserve_bytes = int(reserve_memory_gb * 1024**3)
                 max_gpu_memory = free - reserve_bytes
-                
+
                 # Ensure we don't set a negative or too small limit
                 if max_gpu_memory < 4 * 1024**3:
                     logger.warning(f"Reserved memory ({reserve_memory_gb}GB) leaves too little for model. Using minimum 4GB.")
                     max_gpu_memory = 4 * 1024**3
-                
+
                 # IMPORTANT: Explicitly set other GPUs to 0 to prevent accelerate from using them
-                # This ensures the model only uses GPU 0 (Blackwell) + CPU offload
+                # This ensures the model only uses GPU 0 + CPU offload
                 max_memory = {0: max_gpu_memory, "cpu": "100GiB"}
                 # Block all other GPUs
                 for i in range(1, torch.cuda.device_count()):
                     max_memory[i] = 0
                     logger.info(f"Blocking GPU {i} ({torch.cuda.get_device_name(i)}) from model loading")
-                
+
                 logger.info(f"Setting max GPU memory to {max_gpu_memory/1024**3:.1f}GB (reserving {reserve_memory_gb}GB)")
                 logger.info(f"VRAM status: {free_gb:.1f}GB free of {total_gb:.1f}GB total")
 
@@ -323,16 +371,23 @@ class HunyuanImage3FullLoader:
             patch_hunyuan_generate_image(model)
 
             logger.info("Verifying device placement...")
-            ensure_model_on_device(model, torch.device("cuda:0"), skip_quantized_params=False)
+            ensure_model_on_device(model, target_device, skip_quantized_params=False)
 
             HunyuanModelCache.store(model_path_str, model)
-            
+
             # Log memory usage
-            if torch.cuda.is_available():
+            if device_manager.device_type.value == "cuda":
                 allocated = torch.cuda.memory_allocated(0) / 1024**3
                 reserved = torch.cuda.memory_reserved(0) / 1024**3
                 logger.info(f"✓ Model loaded - VRAM Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
-            
+            elif device_manager.device_type.value == "mps":
+                try:
+                    import psutil
+                    ram = psutil.virtual_memory()
+                    logger.info(f"✓ Model loaded on MPS - System RAM: {ram.available/1024**3:.1f}GB available / {ram.total/1024**3:.1f}GB total")
+                except Exception:
+                    logger.info("✓ Model loaded on MPS")
+
             logger.info("✓ Model ready for generation")
             return (model,)
         
@@ -368,13 +423,22 @@ class HunyuanImage3FullGPULoader:
 
     @classmethod
     def INPUT_TYPES(cls):
-        gpu_options = ["cuda:0"]
+        device_manager = get_device_manager()
+        gpu_options = []
+
+        # Add CUDA GPUs
         if torch.cuda.is_available():
-            gpu_options = []
             for i in range(torch.cuda.device_count()):
                 props = torch.cuda.get_device_properties(i)
                 gpu_options.append(f"cuda:{i} ({props.name}, {props.total_memory/1024**3:.1f}GB)")
-        
+
+        # Add MPS
+        if device_manager.is_mps_available:
+            gpu_options.append("mps (Apple Silicon)")
+
+        if not gpu_options:
+            gpu_options = ["cuda:0"]  # Fallback
+
         return {
             "required": {
                 "model_name": (cls._get_available_models(),),
@@ -960,13 +1024,13 @@ class HunyuanImage3SingleGPU88GB:
                 patch_dynamic_cache_dtype()
                 patch_static_cache_lazy_init()
                 patch_hunyuan_generate_image(cached)
-                ensure_model_on_device(cached, torch.device("cuda:0"), skip_quantized_params=False)
+                ensure_model_on_device(cached, target_device, skip_quantized_params=False)
                 return (cached,)
 
         if not torch.cuda.is_available():
             raise RuntimeError("This loader requires CUDA")
 
-        target_device = torch.device("cuda:0")
+        target_device = target_device
         reserve_memory_gb = float(reserve_memory_gb)
         
         logger.info("=" * 60)
